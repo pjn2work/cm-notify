@@ -14,6 +14,13 @@ let previewEventSource = null;
 let alertedVehicles = new Set();
 let isMonitoring = false;
 
+// Map state
+let map = null;
+let busMapMarkers = {};
+let routePolyline = null;
+let routeStopMarkers = {}; // keyed by stop_id
+let currentView = 'timeline';
+
 // Audio Context for sound alerts
 let audioCtx = null;
 
@@ -25,6 +32,7 @@ document.addEventListener("DOMContentLoaded", () => {
     initLineSearch();
     initNotificationSettings();
     initStatusCheck();
+    document.getElementById("toggleViewBtn").addEventListener("click", toggleView);
 });
 
 // Check API Connection Status
@@ -139,6 +147,8 @@ function selectLine(line) {
     resetMonitoringState();
     selectedPattern = null;
     patternPath = [];
+    clearMapRoute();
+    clearMapBuses();
     document.getElementById("welcomeContainer").style.display = "flex";
     document.getElementById("monitorDashboard").style.display = "none";
     document.getElementById("alertConfigDetails").style.display = "none";
@@ -209,7 +219,10 @@ async function selectPattern(pattern) {
         
         // Render Timeline
         renderTimeline(patternPath);
-        
+
+        // Draw route on map if already initialized
+        if (map) drawRouteOnMap();
+
         // Start preview SSE to show live bus positions immediately
         startPreview(pattern.id);
         
@@ -282,6 +295,7 @@ function setAlertStart(stopId, sequence, name) {
     
     updateTimelineHighlight();
     validateMonitoringButton();
+    refreshMapStopColors();
 }
 
 function setAlertEnd(stopId, sequence, name) {
@@ -300,6 +314,7 @@ function setAlertEnd(stopId, sequence, name) {
     
     updateTimelineHighlight();
     validateMonitoringButton();
+    refreshMapStopColors();
 }
 
 // Update Timeline Highlight Graphics
@@ -552,8 +567,9 @@ function stopMonitoring() {
     document.querySelectorAll(".direction-card").forEach(c => c.style.pointerEvents = "auto");
     document.querySelectorAll(".action-btn").forEach(b => b.disabled = false);
     
-    // Clear vehicle elements on map
+    // Clear vehicle elements on timeline and map
     document.querySelectorAll(".bus-marker, .bus-tooltip").forEach(el => el.remove());
+    clearMapBuses();
     document.getElementById("activeBusesCount").textContent = "0 active buses";
     document.getElementById("activeAlertsContainer").innerHTML = "";
     
@@ -683,6 +699,11 @@ function handleMonitoringData(data) {
         }
     }
     
+    // 3b. Update map bus markers if in map view
+    if (currentView === 'map' && map) {
+        updateMapBuses(buses);
+    }
+
     // 4. Update the Active Alerts Banner Panel
     const alertsContainer = document.getElementById("activeAlertsContainer");
     alertsContainer.innerHTML = "";
@@ -731,6 +752,155 @@ function handleMonitoringData(data) {
         `;
         alertsContainer.appendChild(statusBanner);
     }
+}
+
+// ---- Map View ----
+function toggleView() {
+    const goingToMap = currentView === 'timeline';
+    currentView = goingToMap ? 'map' : 'timeline';
+
+    document.querySelector('.route-timeline-container').style.display = goingToMap ? 'none' : '';
+    document.getElementById('mapView').style.display = goingToMap ? 'flex' : 'none';
+    document.getElementById('toggleViewBtnText').textContent = goingToMap ? 'Timeline View' : 'Map View';
+
+    if (goingToMap) {
+        // Defer so the container is rendered before Leaflet initializes/resizes
+        setTimeout(() => initMap(), 0);
+    }
+}
+
+function initMap() {
+    if (!map) {
+        // Default center: Lisbon metropolitan area
+        map = L.map('leafletMap', { zoomControl: true }).setView([38.72, -9.14], 11);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+        drawRouteOnMap();
+    } else {
+        map.invalidateSize();
+        if (routePolyline) {
+            map.fitBounds(routePolyline.getBounds(), { padding: [30, 30] });
+        }
+    }
+}
+
+function drawRouteOnMap() {
+    if (!map) return;
+    clearMapRoute();
+
+    const coords = patternPath
+        .filter(step => step.lat != null && step.lon != null)
+        .map(step => [step.lat, step.lon]);
+
+    if (coords.length >= 2) {
+        const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
+        routePolyline = L.polyline(coords, { color: lineColor, weight: 4, opacity: 0.85 }).addTo(map);
+        map.fitBounds(routePolyline.getBounds(), { padding: [30, 30] });
+    }
+
+    patternPath.forEach((step, idx) => {
+        if (step.lat == null || step.lon == null) return;
+        const isTerminus = idx === 0 || idx === patternPath.length - 1;
+        const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
+        const marker = L.circleMarker([step.lat, step.lon], {
+            radius: isTerminus ? 7 : 4,
+            fillColor: isTerminus ? lineColor : '#94a3b8',
+            color: '#0f172a',
+            weight: 1.5,
+            opacity: 1,
+            fillOpacity: 1
+        }).addTo(map);
+        marker.bindTooltip(step.name, { direction: 'top', opacity: 0.95 });
+        routeStopMarkers[String(step.stop_id)] = marker;
+    });
+
+    refreshMapStopColors();
+}
+
+function refreshMapStopColors() {
+    if (!map) return;
+    const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
+    const lastIdx = patternPath.length - 1;
+
+    patternPath.forEach((step, idx) => {
+        const marker = routeStopMarkers[String(step.stop_id)];
+        if (!marker) return;
+        const isTerminus = idx === 0 || idx === lastIdx;
+        const isAlertStart = String(step.stop_id) === String(startStopId);
+        const isDestination = String(step.stop_id) === String(endStopId);
+
+        let fillColor, radius;
+        if (isAlertStart) {
+            fillColor = '#f59e0b';
+            radius = 8;
+        } else if (isDestination) {
+            fillColor = '#10b981';
+            radius = 8;
+        } else if (isTerminus) {
+            fillColor = lineColor;
+            radius = 7;
+        } else {
+            fillColor = '#94a3b8';
+            radius = 4;
+        }
+
+        marker.setStyle({ fillColor });
+        marker.setRadius(radius);
+    });
+}
+
+function updateMapBuses(buses) {
+    if (!map) return;
+
+    const currentIds = new Set(buses.map(b => b.vehicle_id));
+
+    // Remove markers for buses no longer in the feed
+    for (const id of Object.keys(busMapMarkers)) {
+        if (!currentIds.has(id)) {
+            busMapMarkers[id].remove();
+            delete busMapMarkers[id];
+        }
+    }
+
+    buses.forEach(bus => {
+        if (bus.lat == null || bus.lon == null) return;
+
+        const alerting = bus.is_in_alert_zone;
+        const icon = L.divIcon({
+            className: '',
+            html: `<div class="map-bus-marker${alerting ? ' alerting' : ''}">${bus.license_plate}</div>`,
+            iconSize: [80, 24],
+            iconAnchor: [40, 12]
+        });
+
+        if (busMapMarkers[bus.vehicle_id]) {
+            busMapMarkers[bus.vehicle_id].setLatLng([bus.lat, bus.lon]);
+            busMapMarkers[bus.vehicle_id].setIcon(icon);
+        } else {
+            const marker = L.marker([bus.lat, bus.lon], { icon }).addTo(map);
+            marker.bindPopup(`<b>${bus.license_plate}</b><br>${bus.current_stop_name}`);
+            busMapMarkers[bus.vehicle_id] = marker;
+        }
+    });
+}
+
+function clearMapBuses() {
+    for (const id of Object.keys(busMapMarkers)) {
+        busMapMarkers[id].remove();
+    }
+    busMapMarkers = {};
+}
+
+function clearMapRoute() {
+    if (routePolyline) {
+        routePolyline.remove();
+        routePolyline = null;
+    }
+    Object.values(routeStopMarkers).forEach(m => m.remove());
+    routeStopMarkers = {};
 }
 
 // Trigger Notifications

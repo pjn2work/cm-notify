@@ -1066,3 +1066,89 @@ body {
     gap: 12px;
     margin-top: 10px;
 }
+
+/* View Toggle */
+.status-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.view-toggle-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 20px;
+    border: 1px solid var(--border-color);
+    background: rgba(99, 102, 241, 0.08);
+    color: var(--text-primary);
+    font-family: 'Inter', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition-fast);
+    white-space: nowrap;
+}
+
+.view-toggle-btn:hover {
+    background: rgba(99, 102, 241, 0.18);
+    border-color: var(--primary);
+}
+
+/* Map View */
+#mapView {
+    flex: 1;
+    min-height: 460px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+}
+
+#leafletMap {
+    width: 100%;
+    height: 100%;
+    min-height: 460px;
+}
+
+/* Map bus markers (Leaflet divIcon) */
+.map-bus-marker {
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid rgba(99, 102, 241, 0.35);
+    border-left: 3px solid var(--primary);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+}
+
+.map-bus-marker.alerting {
+    border-left-color: var(--accent-red);
+    background: rgba(239, 68, 68, 0.15);
+}
+
+/* Leaflet dark theme overrides */
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+    background: rgba(15, 23, 42, 0.96);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.leaflet-popup-content-wrapper {
+    border-radius: 8px;
+}
+
+.leaflet-popup-content a {
+    color: var(--primary);
+}
+
+.leaflet-container a.leaflet-popup-close-button {
+    color: var(--text-secondary);
+}
