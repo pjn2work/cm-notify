@@ -36,6 +36,7 @@ SHAPES_CACHE: Dict[str, dict] = {}
 VEHICLES_BY_PATTERN: Dict[str, List[dict]] = {}
 VEHICLES_LAST_UPDATED: float = 0.0
 CACHE_LOCK = asyncio.Lock()
+ACTIVE_SSE_CLIENTS: int = 0
 
 API_BASE_URL = "https://api.carrismetropolitana.pt/v2"
 HTTP_HEADERS = {"User-Agent": "CarrisMetropolitanaBusNotifier/1.0"}
@@ -104,11 +105,12 @@ async def update_vehicles_data(client: httpx.AsyncClient) -> bool:
     return False
 
 async def background_vehicle_poller():
-    """Background task to poll vehicle positions every 10 seconds."""
+    """Background task to poll vehicle positions every 10 seconds, only when clients are connected."""
     logger.info("Starting background vehicle poller...")
     async with httpx.AsyncClient() as client:
         while True:
-            await update_vehicles_data(client)
+            if ACTIVE_SSE_CLIENTS > 0:
+                await update_vehicles_data(client)
             await asyncio.sleep(10.0)
 
 async def get_pattern_data(pattern_id: str) -> Optional[dict]:
@@ -276,111 +278,116 @@ async def monitor_pattern(
     """Server-Sent Events endpoint to stream real-time updates for a monitored pattern and alert range."""
     
     async def event_generator():
-        # Retrieve and check pattern
-        pattern = await get_pattern_data(pattern_id)
-        if not pattern:
-            yield "event: error\ndata: {\"error\": \"Pattern not found\"}\n\n"
-            return
-            
-        path = pattern.get("path", [])
-        stop_seqs = {step["stop_id"]: step["stop_sequence"] for step in path}
-        
-        has_alert_zone = start_stop_id is not None and end_stop_id is not None
-        start_seq = None
-        end_seq = None
-        start_stop_id_real = None
-        end_stop_id_real = None
-
-        if has_alert_zone:
-            start_seq = stop_seqs.get(start_stop_id)
-            end_seq = stop_seqs.get(end_stop_id)
-            
-            if start_seq is None or end_seq is None:
-                yield "event: error\ndata: {\"error\": \"Start or Destination stop not found in pattern path\"}\n\n"
+        global ACTIVE_SSE_CLIENTS
+        ACTIVE_SSE_CLIENTS += 1
+        try:
+            # Retrieve and check pattern
+            pattern = await get_pattern_data(pattern_id)
+            if not pattern:
+                yield "event: error\ndata: {\"error\": \"Pattern not found\"}\n\n"
                 return
-                
-            # Standardize range: start_seq must be less than or equal to end_seq
-            if start_seq > end_seq:
-                # If swapped, swap them back
-                start_seq, end_seq = end_seq, start_seq
-                start_stop_id_real, end_stop_id_real = end_stop_id, start_stop_id
-            else:
-                start_stop_id_real, end_stop_id_real = start_stop_id, end_stop_id
 
-            logger.info(f"Started monitoring SSE connection: pattern={pattern_id}, alert_zone=[{start_seq} ({start_stop_id_real}) -> {end_seq} ({end_stop_id_real})]")
-        else:
-            logger.info(f"Started preview SSE connection: pattern={pattern_id}")
+            path = pattern.get("path", [])
+            stop_seqs = {step["stop_id"]: step["stop_sequence"] for step in path}
 
-        # SSE keep-alive header
-        yield "comment: connection established\n\n"
+            has_alert_zone = start_stop_id is not None and end_stop_id is not None
+            start_seq = None
+            end_seq = None
+            start_stop_id_real = None
+            end_stop_id_real = None
 
-        while True:
-            # Read from memory-cached vehicle locations
-            async with CACHE_LOCK:
-                vehicles = VEHICLES_BY_PATTERN.get(pattern_id, [])
-                last_updated = VEHICLES_LAST_UPDATED
+            if has_alert_zone:
+                start_seq = stop_seqs.get(start_stop_id)
+                end_seq = stop_seqs.get(end_stop_id)
 
-            monitored_buses = []
-            for v in vehicles:
-                stop_id = v.get("stop_id")
-                current_seq = stop_seqs.get(stop_id)
-                
-                # If vehicle stop is not on pattern path, skip or fallback to sequence
-                if current_seq is None:
-                    continue
-                    
-                if has_alert_zone:
-                    is_in_alert_zone = start_seq <= current_seq <= end_seq
-                    stops_to_start = start_seq - current_seq if current_seq < start_seq else 0
-                    stops_to_destination = end_seq - current_seq if current_seq <= end_seq else -1
+                if start_seq is None or end_seq is None:
+                    yield "event: error\ndata: {\"error\": \"Start or Destination stop not found in pattern path\"}\n\n"
+                    return
+
+                # Standardize range: start_seq must be less than or equal to end_seq
+                if start_seq > end_seq:
+                    # If swapped, swap them back
+                    start_seq, end_seq = end_seq, start_seq
+                    start_stop_id_real, end_stop_id_real = end_stop_id, start_stop_id
                 else:
-                    is_in_alert_zone = False
-                    stops_to_start = 0
-                    stops_to_destination = -1
-                
-                stop_info = STOPS_CACHE.get(stop_id, {})
-                stop_name = stop_info.get("long_name", f"Stop {stop_id}")
-                
-                monitored_buses.append({
-                    "vehicle_id": v.get("id"),
-                    "license_plate": v.get("license_plate", "Unknown"),
-                    "lat": v.get("lat"),
-                    "lon": v.get("lon"),
-                    "speed": v.get("speed", 0),
-                    "bearing": v.get("bearing", 0),
-                    "current_stop_id": stop_id,
-                    "current_stop_name": stop_name,
-                    "current_stop_sequence": current_seq,
-                    "current_status": v.get("current_status", "UNKNOWN"),
-                    "is_in_alert_zone": is_in_alert_zone,
-                    "stops_to_start": stops_to_start,
-                    "stops_to_destination": stops_to_destination,
-                    "make": v.get("make", ""),
-                    "model": v.get("model", ""),
-                    "owner": v.get("owner", ""),
-                    "shift_id": v.get("shift_id", ""),
-                    "propulsion": v.get("propulsion", ""),
-                    "bikes_allowed": v.get("bikes_allowed", ""),
-                    "capacity_total": v.get("capacity_total", ""),
-                    "contactless": v.get("contactless", ""),
-                    "wheelchair_accessible": v.get("wheelchair_accessible", ""),
-                })
+                    start_stop_id_real, end_stop_id_real = start_stop_id, end_stop_id
 
-            import json
-            payload = {
-                "pattern_id": pattern_id,
-                "start_stop_id": start_stop_id_real,
-                "start_stop_sequence": start_seq,
-                "end_stop_id": end_stop_id_real,
-                "end_stop_sequence": end_seq,
-                "buses": monitored_buses,
-                "last_updated": last_updated
-            }
+                logger.info(f"Started monitoring SSE connection: pattern={pattern_id}, alert_zone=[{start_seq} ({start_stop_id_real}) -> {end_seq} ({end_stop_id_real})]")
+            else:
+                logger.info(f"Started preview SSE connection: pattern={pattern_id}")
 
-            yield f"data: {json.dumps(payload)}\n\n"
-            
-            # Sleep 5 seconds before checking again
-            await asyncio.sleep(5.0)
+            # SSE keep-alive header
+            yield "comment: connection established\n\n"
+
+            while True:
+                # Read from memory-cached vehicle locations
+                async with CACHE_LOCK:
+                    vehicles = VEHICLES_BY_PATTERN.get(pattern_id, [])
+                    last_updated = VEHICLES_LAST_UPDATED
+
+                monitored_buses = []
+                for v in vehicles:
+                    stop_id = v.get("stop_id")
+                    current_seq = stop_seqs.get(stop_id)
+
+                    # If vehicle stop is not on pattern path, skip or fallback to sequence
+                    if current_seq is None:
+                        continue
+
+                    if has_alert_zone:
+                        is_in_alert_zone = start_seq <= current_seq <= end_seq
+                        stops_to_start = start_seq - current_seq if current_seq < start_seq else 0
+                        stops_to_destination = end_seq - current_seq if current_seq <= end_seq else -1
+                    else:
+                        is_in_alert_zone = False
+                        stops_to_start = 0
+                        stops_to_destination = -1
+
+                    stop_info = STOPS_CACHE.get(stop_id, {})
+                    stop_name = stop_info.get("long_name", f"Stop {stop_id}")
+
+                    monitored_buses.append({
+                        "vehicle_id": v.get("id"),
+                        "license_plate": v.get("license_plate", "Unknown"),
+                        "lat": v.get("lat"),
+                        "lon": v.get("lon"),
+                        "speed": v.get("speed", 0),
+                        "bearing": v.get("bearing", 0),
+                        "current_stop_id": stop_id,
+                        "current_stop_name": stop_name,
+                        "current_stop_sequence": current_seq,
+                        "current_status": v.get("current_status", "UNKNOWN"),
+                        "is_in_alert_zone": is_in_alert_zone,
+                        "stops_to_start": stops_to_start,
+                        "stops_to_destination": stops_to_destination,
+                        "make": v.get("make", ""),
+                        "model": v.get("model", ""),
+                        "owner": v.get("owner", ""),
+                        "shift_id": v.get("shift_id", ""),
+                        "propulsion": v.get("propulsion", ""),
+                        "bikes_allowed": v.get("bikes_allowed", ""),
+                        "capacity_total": v.get("capacity_total", ""),
+                        "contactless": v.get("contactless", ""),
+                        "wheelchair_accessible": v.get("wheelchair_accessible", ""),
+                    })
+
+                import json
+                payload = {
+                    "pattern_id": pattern_id,
+                    "start_stop_id": start_stop_id_real,
+                    "start_stop_sequence": start_seq,
+                    "end_stop_id": end_stop_id_real,
+                    "end_stop_sequence": end_seq,
+                    "buses": monitored_buses,
+                    "last_updated": last_updated
+                }
+
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                # Sleep 5 seconds before checking again
+                await asyncio.sleep(5.0)
+        finally:
+            ACTIVE_SSE_CLIENTS -= 1
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
