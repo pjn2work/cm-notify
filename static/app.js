@@ -20,6 +20,7 @@ let busMapMarkers = {};
 let routePolyline = null;
 let routeStopMarkers = {}; // keyed by stop_id
 let currentView = 'timeline';
+let patternShape = null; // GeoJSON shape geometry for the selected pattern
 
 // Audio Context for sound alerts
 let audioCtx = null;
@@ -147,6 +148,7 @@ function selectLine(line) {
     resetMonitoringState();
     selectedPattern = null;
     patternPath = [];
+    patternShape = null;
     clearMapRoute();
     clearMapBuses();
     document.getElementById("welcomeContainer").style.display = "flex";
@@ -204,7 +206,18 @@ async function selectPattern(pattern) {
         const res = await fetch(`/api/patterns/${pattern.id}`);
         const data = await res.json();
         patternPath = data.path;
-        
+
+        // Fetch shape geometry for accurate map route rendering
+        patternShape = null;
+        if (data.shape_id) {
+            try {
+                const shapeRes = await fetch(`/api/shapes/${encodeURIComponent(data.shape_id)}`);
+                if (shapeRes.ok) patternShape = await shapeRes.json();
+            } catch (e) {
+                console.warn("Could not fetch shape geometry:", e);
+            }
+        }
+
         // Show monitoring panels
         document.getElementById("welcomeContainer").style.display = "none";
         document.getElementById("monitorDashboard").style.display = "flex";
@@ -795,8 +808,15 @@ function drawRouteOnMap() {
         .filter(step => step.lat != null && step.lon != null)
         .map(step => [step.lat, step.lon]);
 
-    if (coords.length >= 2) {
-        const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
+    const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
+
+    if (patternShape && patternShape.geojson && patternShape.geojson.geometry) {
+        // Use precise shape geometry — GeoJSON coords are [lon, lat], Leaflet needs [lat, lon]
+        const latlngs = patternShape.geojson.geometry.coordinates.map(c => [c[1], c[0]]);
+        routePolyline = L.polyline(latlngs, { color: lineColor, weight: 4, opacity: 0.85 }).addTo(map);
+        map.fitBounds(routePolyline.getBounds(), { padding: [30, 30] });
+    } else if (coords.length >= 2) {
+        // Fallback: straight lines between stops
         routePolyline = L.polyline(coords, { color: lineColor, weight: 4, opacity: 0.85 }).addTo(map);
         map.fitBounds(routePolyline.getBounds(), { padding: [30, 30] });
     }
@@ -804,7 +824,6 @@ function drawRouteOnMap() {
     patternPath.forEach((step, idx) => {
         if (step.lat == null || step.lon == null) return;
         const isTerminus = idx === 0 || idx === patternPath.length - 1;
-        const lineColor = (selectedLine && selectedLine.color) ? selectedLine.color : '#4f46e5';
         const marker = L.circleMarker([step.lat, step.lon], {
             radius: isTerminus ? 7 : 4,
             fillColor: isTerminus ? lineColor : '#94a3b8',

@@ -6,10 +6,12 @@ A real-time bus tracking and notification application for **Carris Metropolitana
 
 ## Features
 
-- **Real-Time Tracking**: Queries vehicle locations every 10 seconds in a background thread and streams updates to clients.
+- **Real-Time Tracking**: Queries vehicle locations every 10 seconds in a background task and streams updates to clients via SSE.
 - **Server-Sent Events (SSE)**: Streams real-time bus positions, speed, bearing, and distance to stops using a persistent HTTP connection.
 - **Proximity Alerts**: Allows users to specify a start and destination stop, highlighting when a bus enters the monitored "alert zone" and counting remaining stops.
-- **Caching Layer**: Caches static data (lines, stops, patterns) locally from the Carris Metropolitana API to keep response times fast and reduce load on external APIs.
+- **Browser & Sound Notifications**: Triggers a chime and/or a desktop browser notification when a bus enters the alert zone.
+- **Caching Layer**: Caches static data (lines, stops, patterns, shapes) from the Carris Metropolitana API to keep response times fast and reduce load on the upstream API.
+- **Interactive Map View**: Renders the true route geometry (from GTFS shape data with hundreds of GPS points) on a Leaflet map, with live bus markers and highlighted alert-start/destination stops.
 
 ---
 
@@ -78,11 +80,28 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload
 ## Backend API Endpoints
 
 ### Static & UI Endpoints
-- `GET /` - Serves the single-page application (`static/index.html`).
-- `GET /static/...` - Serves frontend assets.
+- `GET /` — Serves the single-page application (`static/index.html`).
+- `GET /static/...` — Serves frontend assets.
 
 ### Data & Monitoring Endpoints
-- `GET /api/lines?search=<query>` - Retrieve list of lines, with optional text search/filtering.
-- `GET /api/lines/{line_id}/patterns` - Retrieve all patterns/directions for a specific line.
-- `GET /api/patterns/{pattern_id}` - Retrieve details for a pattern path, including stop sequence and coordinate information.
-- `GET /api/monitor?pattern_id=<id>&start_stop_id=<stop_id>&end_stop_id=<stop_id>` - Establish a Server-Sent Events connection streaming real-time bus locations and calculations (such as stops left to target, active bus count) for a specified pattern.
+- `GET /api/lines?search=<query>` — Retrieve list of lines, with optional text search/filtering.
+- `GET /api/lines/{line_id}/patterns` — Retrieve all patterns/directions for a specific line, including active bus count per direction.
+- `GET /api/patterns/{pattern_id}` — Retrieve full details for a pattern, including the ordered stop path (with coordinates) and `shape_id`.
+- `GET /api/shapes/{shape_id}` — Proxy and cache the GTFS shape geometry for a pattern. Returns a GeoJSON `LineString` with hundreds of precise GPS coordinates representing the true road path of the route.
+- `GET /api/monitor?pattern_id=<id>&start_stop_id=<id>&end_stop_id=<id>` — Establish a Server-Sent Events stream with real-time bus positions, alert-zone status, and stops-to-destination counts. The `start_stop_id` and `end_stop_id` parameters are optional; omitting them enables a preview mode showing all buses without alerts.
+
+---
+
+## Upstream API
+
+This application consumes the public **Carris Metropolitana REST API** (`https://api.carrismetropolitana.pt/v2`).
+
+| Endpoint | Description |
+|---|---|
+| `GET /v2/lines` | All bus lines with metadata (name, color, pattern IDs) |
+| `GET /v2/stops` | All stops with coordinates (`lat`, `lon`) and name |
+| `GET /v2/patterns/{pattern_id}` | Pattern details: stop path sequence, `shape_id`, headsign |
+| `GET /v2/shapes/{shape_id}` | Route shape geometry: GeoJSON `LineString` + array of `{shape_pt_lat, shape_pt_lon, shape_pt_sequence, shape_dist_traveled}` points |
+| `GET /v2/vehicles` | Live vehicle positions: `lat`, `lon`, `speed`, `bearing`, `stop_id`, `pattern_id`, `current_status` |
+
+Static data (lines, stops, patterns, shapes) is pre-fetched and cached in memory at startup. Vehicle positions are polled every 10 seconds by a background task.

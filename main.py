@@ -30,6 +30,7 @@ app.add_middleware(
 LINES_CACHE: List[dict] = []
 STOPS_CACHE: Dict[str, dict] = {}
 PATTERNS_CACHE: Dict[str, dict] = {}
+SHAPES_CACHE: Dict[str, dict] = {}
 
 # Vehicle tracking (updated by background task)
 VEHICLES_BY_PATTERN: Dict[str, List[dict]] = {}
@@ -231,8 +232,35 @@ async def get_pattern(pattern_id: str):
         "direction_id": pattern.get("direction_id"),
         "color": pattern.get("color", "#000000"),
         "text_color": pattern.get("text_color", "#ffffff"),
+        "shape_id": pattern.get("shape_id"),
         "path": path
     }
+
+@app.get("/api/shapes/{shape_id:path}")
+async def get_shape(shape_id: str):
+    """Proxy and cache route shape geometry from the Carris Metropolitana API."""
+    if shape_id in SHAPES_CACHE:
+        return SHAPES_CACHE[shape_id]
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{API_BASE_URL}/shapes/{shape_id}",
+                headers=HTTP_HEADERS,
+                timeout=15.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                SHAPES_CACHE[shape_id] = data
+                return data
+            else:
+                raise HTTPException(status_code=response.status_code, detail="Shape not found")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Exception fetching shape {shape_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/monitor")
 async def monitor_pattern(
