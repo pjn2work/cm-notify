@@ -601,14 +601,17 @@ function handleMonitoringData(data) {
     
     const activeAlerts = [];
     const currentAlertedIds = new Set();
-    
+
+    // Track how many buses land at the same vertical position so we can offset duplicates
+    const timelinePosCount = {};
+
     buses.forEach(bus => {
         const stopNode = document.querySelector(`.timeline-node[data-stop-id="${bus.current_stop_id}"]`);
-        
+
         if (stopNode) {
             const idx = parseInt(stopNode.dataset.index);
             const stopTop = stopNode.offsetTop;
-            
+
             let topPosition = stopTop + 2; // Center aligns with the node circle
             let displayStatus = bus.current_status.replace(/_/g, " ").toLowerCase();
             displayStatus = displayStatus.charAt(0).toUpperCase() + displayStatus.slice(1);
@@ -631,13 +634,19 @@ function handleMonitoringData(data) {
                 displayStatus = `Stopped at ${bus.current_stop_name}`;
             }
 
+            // Offset buses that share the same vertical position
+            const posKey = Math.round(topPosition);
+            const stackIdx = timelinePosCount[posKey] || 0;
+            timelinePosCount[posKey] = stackIdx + 1;
+            topPosition += stackIdx * 24;
+
             // Render bus marker
             const marker = document.createElement("div");
             marker.className = "bus-marker";
             if (bus.is_in_alert_zone) {
                 marker.classList.add("alerting");
             }
-            
+
             // Set absolute layout
             marker.style.position = "absolute";
             marker.style.left = "0px";
@@ -884,8 +893,24 @@ function updateMapBuses(buses) {
         }
     }
 
+    // Precompute position groups so co-located buses can be offset
+    const posGroups = {};
+    buses.forEach(b => {
+        if (b.lat == null || b.lon == null) return;
+        const key = `${b.lat.toFixed(4)},${b.lon.toFixed(4)}`;
+        if (!posGroups[key]) posGroups[key] = [];
+        posGroups[key].push(b.vehicle_id);
+    });
+
     buses.forEach(bus => {
         if (bus.lat == null || bus.lon == null) return;
+
+        const posKey = `${bus.lat.toFixed(4)},${bus.lon.toFixed(4)}`;
+        const group = posGroups[posKey];
+        const stackIdx = group.indexOf(bus.vehicle_id);
+        // Spread co-located buses ~25 m apart diagonally (0.00022° ≈ 24 m)
+        const lat = bus.lat + stackIdx * 0.00022;
+        const lon = bus.lon + stackIdx * 0.00022;
 
         const alerting = bus.is_in_alert_zone;
         const icon = L.divIcon({
@@ -896,10 +921,10 @@ function updateMapBuses(buses) {
         });
 
         if (busMapMarkers[bus.vehicle_id]) {
-            busMapMarkers[bus.vehicle_id].setLatLng([bus.lat, bus.lon]);
+            busMapMarkers[bus.vehicle_id].setLatLng([lat, lon]);
             busMapMarkers[bus.vehicle_id].setIcon(icon);
         } else {
-            const marker = L.marker([bus.lat, bus.lon], { icon }).addTo(map);
+            const marker = L.marker([lat, lon], { icon }).addTo(map);
             marker.bindPopup(`<b>${bus.license_plate}</b><br>${bus.current_stop_name}`);
             busMapMarkers[bus.vehicle_id] = marker;
         }

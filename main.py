@@ -186,8 +186,13 @@ async def get_line_patterns(line_id: str):
     for pid in pattern_ids:
         p_data = await get_pattern_data(pid)
         if p_data:
+            pattern_stop_ids = {step["stop_id"] for step in p_data.get("path", [])}
             async with CACHE_LOCK:
-                active_count = len(VEHICLES_BY_PATTERN.get(pid, []))
+                vehicles_for_pattern = VEHICLES_BY_PATTERN.get(pid, [])
+            active_count = sum(
+                1 for v in vehicles_for_pattern
+                if v.get("stop_id") in pattern_stop_ids
+            )
             patterns.append({
                 "id": p_data.get("id"),
                 "headsign": p_data.get("headsign"),
