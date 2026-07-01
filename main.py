@@ -110,6 +110,7 @@ async def background_vehicle_poller():
     async with httpx.AsyncClient() as client:
         while True:
             if ACTIVE_SSE_CLIENTS > 0:
+                logger.info(f"[{ACTIVE_SSE_CLIENTS} client(s)] Polling vehicles...")
                 await update_vehicles_data(client)
             await asyncio.sleep(10.0)
 

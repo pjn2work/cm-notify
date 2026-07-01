@@ -34,7 +34,38 @@ document.addEventListener("DOMContentLoaded", () => {
     initNotificationSettings();
     initStatusCheck();
     document.getElementById("toggleViewBtn").addEventListener("click", toggleView);
+    initVisibilityHandling();
 });
+
+// Pause SSE when tab is hidden, resume when visible again
+function initVisibilityHandling() {
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+            // Tab hidden — close all SSE connections to stop server polling
+            stopPreview();
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        } else {
+            // Tab visible again — reconnect whichever stream was active
+            if (isMonitoring && selectedPattern) {
+                const url = `/api/monitor?pattern_id=${encodeURIComponent(selectedPattern.id)}&start_stop_id=${encodeURIComponent(startStopId)}&end_stop_id=${encodeURIComponent(endStopId)}`;
+                eventSource = new EventSource(url);
+                eventSource.onmessage = (event) => {
+                    const payload = JSON.parse(event.data);
+                    handleMonitoringData(payload);
+                };
+                eventSource.onerror = (err) => {
+                    console.error("SSE connection error:", err);
+                    document.getElementById("activeBusesCount").textContent = "Reconnecting stream...";
+                };
+            } else if (selectedPattern && !isMonitoring) {
+                startPreview(selectedPattern.id);
+            }
+        }
+    });
+}
 
 // Check API Connection Status
 async function initStatusCheck() {
