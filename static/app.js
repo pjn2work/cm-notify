@@ -635,8 +635,8 @@ function handleMonitoringData(data) {
             tooltip.innerHTML = `
                 <div class="bus-details${isExpanded ? ' open' : ''}">
                     <span class="bus-detail">${(bus.speed !== undefined && bus.speed !== null) ? Number(bus.speed).toFixed(1) : "0"} km/h • ${displayStatus}</span>
-                    ${bus.make ? `<span class="bus-detail">${bus.make} ${bus.model}</span>` : ""}
-                    <span class="bus-detail">ID: ${bus.vehicle_id}</span>
+                    ${bus.make ? `<span class="bus-detail">${bus.make} - ${bus.owner} - ${bus.propulsion}</span>` : ""}
+                    <span class="bus-detail">ID: ${bus.vehicle_id}  •  Capacity: ${bus.capacity_total}  •  Contactless: ${bus.contactless}  •  Wheelchair: ${bus.wheelchair_accessible}  •  Bikes: ${bus.bikes_allowed}</span>
                 </div>
             `;
             

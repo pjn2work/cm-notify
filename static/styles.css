@@ -588,7 +588,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 20px;
-    padding: 28px;
+    padding: 28px 28px 28px 62px;
     flex-grow: 1;
 }
 
@@ -955,9 +955,9 @@ body {
 
 .bus-plate {
     position: absolute;
-    bottom: 28px;
-    left: 50%;
-    transform: translateX(-50%);
+    top: 50%;
+    right: calc(100% + 6px);
+    transform: translateY(-50%);
     display: inline-block;
     background: rgba(15, 23, 42, 0.92);
     border: 1px solid var(--border-color);

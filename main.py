@@ -323,7 +323,14 @@ async def monitor_pattern(
                     "stops_to_start": stops_to_start,
                     "stops_to_destination": stops_to_destination,
                     "make": v.get("make", ""),
-                    "model": v.get("model", "")
+                    "model": v.get("model", ""),
+                    "owner": v.get("owner", ""),
+                    "shift_id": v.get("shift_id", ""),
+                    "propulsion": v.get("propulsion", ""),
+                    "bikes_allowed": v.get("bikes_allowed", ""),
+                    "capacity_total": v.get("capacity_total", ""),
+                    "contactless": v.get("contactless", ""),
+                    "wheelchair_accessible": v.get("wheelchair_accessible", ""),
                 })
 
             import json
