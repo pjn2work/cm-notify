@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carris Metropolitana Live Alert</title>
+    <meta name="description" content="Get real-time browser notifications when Carris Metropolitana buses approach your destination or stop.">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="bg-gradient-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+    </div>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-logo">
+                <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <rect x="2" y="4" width="20" height="15" rx="2" />
+                    <line x1="2" y1="14" x2="22" y2="14" />
+                    <path d="M6 18h0" stroke-linecap="round" />
+                    <path d="M18 18h0" stroke-linecap="round" />
+                    <path d="M8 10h2" />
+                    <path d="M14 10h2" />
+                </svg>
+                <h1>CM <span>Live Alert</span></h1>
+            </div>
+            <div class="api-status-pill">
+                <span class="status-indicator pinging" id="statusDot"></span>
+                <span class="status-text" id="statusText">Connecting API...</span>
+            </div>
+        </header>
+
+        <!-- Main Workspace -->
+        <main class="app-main">
+            <!-- Sidebar / Configurations -->
+            <section class="config-section glass-panel">
+                <div class="panel-header">
+                    <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none">
+                        <circle cx="12" cy="12" r="3" />
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                    </svg>
+                    <h2>Alert Settings</h2>
+                </div>
+
+                <div class="form-group">
+                    <label for="lineInput">Select Bus Line</label>
+                    <div class="search-container">
+                        <input type="text" id="lineInput" autocomplete="off" placeholder="Search line number or name (e.g. 1723)...">
+                        <button class="clear-btn" id="clearLineBtn" style="display:none;">&times;</button>
+                        <div class="autocomplete-list" id="autocompleteList"></div>
+                    </div>
+                </div>
+
+                <!-- Direction selector (Shows when line is selected) -->
+                <div class="form-group" id="directionGroup" style="display: none;">
+                    <label>Choose Direction</label>
+                    <div class="direction-options" id="directionOptions">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <!-- Alert Config Panel (Shows when direction is loaded) -->
+                <div class="alert-config-details" id="alertConfigDetails" style="display: none;">
+                    <div class="divider"></div>
+                    
+                    <div class="selected-stops-summary">
+                        <div class="stop-summary-card start">
+                            <span class="label">Alert Starts At</span>
+                            <span class="value" id="startStopVal">Select on route map below</span>
+                        </div>
+                        <div class="stop-summary-card end">
+                            <span class="label">Your Destination</span>
+                            <span class="value" id="endStopVal">Select on route map below</span>
+                        </div>
+                    </div>
+
+                    <div class="settings-toggles">
+                        <label class="toggle-control">
+                            <input type="checkbox" id="soundToggle" checked>
+                            <span class="control-indicator"></span>
+                            <span class="control-label">Play Chime Alert</span>
+                        </label>
+                        <label class="toggle-control">
+                            <input type="checkbox" id="notificationToggle">
+                            <span class="control-indicator"></span>
+                            <span class="control-label">Browser Notifications</span>
+                        </label>
+                    </div>
+
+                    <button class="btn btn-primary" id="startMonitorBtn" disabled>
+                        <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                            <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+                        </svg>
+                        Start Monitoring
+                    </button>
+                    <button class="btn btn-danger" id="stopMonitorBtn" style="display: none;">
+                        <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                        </svg>
+                        Stop Monitoring
+                    </button>
+                </div>
+            </section>
+
+            <!-- Route Map & Tracking Dashboard -->
+            <section class="dashboard-section glass-panel">
+                <!-- Welcome View -->
+                <div class="welcome-container" id="welcomeContainer">
+                    <div class="welcome-icon">
+                        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" fill="none">
+                            <circle cx="12" cy="12" r="10" />
+                            <polyline points="12 6 12 12 16 14" />
+                        </svg>
+                    </div>
+                    <h3>Welcome to CM Live Alert</h3>
+                    <p>To begin tracking a bus, search and select a bus line in the settings panel. You'll then be able to define your alert stops directly from the interactive route timeline.</p>
+                </div>
+
+                <!-- Monitoring Dashboard View (Hidden initially) -->
+                <div class="monitor-dashboard" id="monitorDashboard" style="display: none;">
+                    <div class="dashboard-status-bar">
+                        <div class="route-info-badge">
+                            <span class="badge-line-color" id="badgeLineColor"></span>
+                            <span class="badge-text" id="badgeLineText">Line 1723</span>
+                        </div>
+                        <div class="live-buses-pill">
+                            <span class="pulse-dot"></span>
+                            <span id="activeBusesCount">0 active buses</span>
+                        </div>
+                    </div>
+
+                    <!-- Giant Alerts Display -->
+                    <div class="active-alerts-container" id="activeAlertsContainer">
+                        <!-- Populated by JS when buses enter the alert zone -->
+                    </div>
+
+                    <!-- Vertical Stop Timeline -->
+                    <div class="route-timeline-container">
+                        <div class="timeline-instructions">
+                            <span class="info-icon">ℹ</span> Select your destination and where to start alerting by clicking the stops on the map below.
+                        </div>
+                        
+                        <div class="vertical-timeline" id="routeTimeline">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Notification Permission Request Modal -->
+    <div class="modal-overlay" id="notificationModal">
+        <div class="modal-content glass-panel">
+            <h3>Enable Desktop Notifications</h3>
+            <p>This webapp uses browser notifications to alert you when a bus enters your notification zone, even when you are viewing other tabs. Would you like to enable them?</p>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="modalDismissBtn">Maybe Later</button>
+                <button class="btn btn-primary" id="modalEnableBtn">Allow Notifications</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
