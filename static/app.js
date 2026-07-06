@@ -9,6 +9,9 @@ let endStopId = null;
 let endStopSeq = null;
 let endStopName = "";
 
+let segmentDurations = {};
+let durationRefreshInterval = null;
+
 let eventSource = null;
 let previewEventSource = null;
 let alertedVehicles = new Set();
@@ -238,6 +241,15 @@ async function selectPattern(pattern) {
         const data = await res.json();
         patternPath = data.path;
 
+        // Fetch historical segment durations and keep them refreshed
+        segmentDurations = {};
+        try {
+            const durRes = await fetch(`/api/patterns/${pattern.id}/durations`);
+            if (durRes.ok) segmentDurations = await durRes.json();
+        } catch (e) { /* non-critical */ }
+        clearInterval(durationRefreshInterval);
+        durationRefreshInterval = setInterval(refreshSegmentDurations, 30000);
+
         // Fetch shape geometry for accurate map route rendering
         patternShape = null;
         if (data.shape_id) {
@@ -317,8 +329,33 @@ function renderTimeline(path) {
         });
         
         container.appendChild(node);
+
+        // Segment info strip between this stop and the next
+        if (idx < path.length - 1) {
+            const nextStep = path[idx + 1];
+            const distM = Math.round((nextStep.distance - step.distance) * 1000);
+            const distText = distM >= 1000
+                ? `${(distM / 1000).toFixed(1)} km`
+                : distM > 0 ? `${distM} m` : null;
+
+            const key = `${step.stop_id}__${nextStep.stop_id}`;
+            const seg = segmentDurations[key];
+            const hasSeg = seg && seg.sample_count > 0;
+
+            if (distText || hasSeg) {
+                const segEl = document.createElement("div");
+                segEl.className = "timeline-segment-info";
+                segEl.dataset.segKey = key;
+                segEl.innerHTML = `
+                    ${distText ? `<span class="seg-dist">${distText}</span>` : ""}
+                    ${hasSeg ? `<span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)}</span>` : ""}
+                    ${hasSeg ? `<span class="seg-range">${formatDuration(seg.min_seconds)}–${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>` : ""}
+                `;
+                container.appendChild(segEl);
+            }
+        }
     });
-    
+
     updateTimelineHighlight();
 }
 
@@ -415,6 +452,9 @@ function resetApp() {
     selectedLine = null;
     selectedPattern = null;
     patternPath = [];
+    segmentDurations = {};
+    clearInterval(durationRefreshInterval);
+    durationRefreshInterval = null;
     resetMonitoringState();
     
     document.getElementById("directionGroup").style.display = "none";
@@ -620,6 +660,43 @@ function stopMonitoring() {
     alertedVehicles.clear();
 }
 
+async function refreshSegmentDurations() {
+    if (!selectedPattern) return;
+    try {
+        const res = await fetch(`/api/patterns/${selectedPattern.id}/durations`);
+        if (!res.ok) return;
+        segmentDurations = await res.json();
+        document.querySelectorAll('.timeline-segment-info[data-seg-key]').forEach(el => {
+            const seg = segmentDurations[el.dataset.segKey];
+            const distSpan = el.querySelector('.seg-dist');
+            const distHtml = distSpan ? distSpan.outerHTML : '';
+            el.innerHTML = distHtml + (seg && seg.sample_count > 0 ? `
+                <span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)}</span>
+                <span class="seg-range">${formatDuration(seg.min_seconds)}–${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>
+            ` : '');
+        });
+    } catch (e) { /* non-critical */ }
+}
+
+function formatEta(seconds) {
+    if (seconds == null) return null;
+    const mins = Math.round(seconds / 60);
+    if (mins <= 0) return "now";
+    return `~${mins} min`;
+}
+
+function etaArrivalTime(seconds) {
+    if (seconds == null) return null;
+    const t = new Date(Date.now() + seconds * 1000);
+    return t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDuration(seconds) {
+    if (seconds == null) return "?";
+    const mins = Math.round(seconds / 60);
+    return mins < 1 ? "<1m" : `${mins}m`;
+}
+
 // Handle Real-Time Updates
 function handleMonitoringData(data) {
     // 1. Update buses count
@@ -701,9 +778,15 @@ function handleMonitoringData(data) {
             
             const isExpanded = expandedBuses.has(bus.vehicle_id);
             
+            const etaStart = formatEta(bus.eta_to_start_seconds);
+            const etaStartTime = etaArrivalTime(bus.eta_to_start_seconds);
+            const etaEnd = formatEta(bus.eta_to_end_seconds);
+            const etaEndTime = etaArrivalTime(bus.eta_to_end_seconds);
             tooltip.innerHTML = `
                 <div class="bus-details${isExpanded ? ' open' : ''}">
                     <span class="bus-detail">${(bus.speed !== undefined && bus.speed !== null) ? Number(bus.speed).toFixed(1) : "0"} km/h • ${displayStatus}</span>
+                    ${etaStart ? `<span class="bus-detail" style="color:#f59e0b;font-weight:600">Your stop: ${etaStart} · ${etaStartTime}</span>` : ""}
+                    ${etaEnd ? `<span class="bus-detail" style="color:#10b981;font-weight:600">Destination: ${etaEnd} · ${etaEndTime}</span>` : ""}
                     ${bus.make ? `<span class="bus-detail">${bus.make} - ${bus.owner} - ${bus.propulsion}</span>` : ""}
                     <span class="bus-detail">ID: ${bus.vehicle_id}  •  Capacity: ${bus.capacity_total}  •  Contactless: ${bus.contactless}  •  Wheelchair: ${bus.wheelchair_accessible}  •  Bikes: ${bus.bikes_allowed}</span>
                 </div>
@@ -768,7 +851,8 @@ function handleMonitoringData(data) {
             
             const stopsLeft = bus.stops_to_destination;
             let stopsText = stopsLeft === 0 ? "arriving at your stop!" : `approaching! ${stopsLeft} stop${stopsLeft > 1 ? "s" : ""} left.`;
-            
+            const etaDestText = formatEta(bus.eta_to_end_seconds);
+
             banner.innerHTML = `
                 <div class="alert-icon">
                     <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none">
@@ -779,7 +863,7 @@ function handleMonitoringData(data) {
                 </div>
                 <div class="alert-message">
                     <span class="headline">Bus approaching! (${bus.license_plate})</span>
-                    <span class="description">Currently at <strong>${bus.current_stop_name}</strong> (${bus.current_status}) • ${stopsText}</span>
+                    <span class="description">Currently at <strong>${bus.current_stop_name}</strong> (${bus.current_status}) • ${stopsText}${etaDestText ? ` Destination in <strong>${etaDestText}</strong>.` : ""}</span>
                 </div>
             `;
             alertsContainer.appendChild(banner);
@@ -872,7 +956,7 @@ function drawRouteOnMap() {
             opacity: 1,
             fillOpacity: 1
         }).addTo(map);
-        marker.bindTooltip(step.name, { direction: 'top', opacity: 0.95 });
+        marker.bindTooltip(`${step.stop_sequence}. ${step.name}`, { direction: 'top', opacity: 0.95 });
         routeStopMarkers[String(step.stop_id)] = marker;
     });
 
