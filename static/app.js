@@ -12,7 +12,6 @@ let endStopName = "";
 let segmentDurations = {};
 let durationRefreshInterval = null;
 let heatmapData = {};
-let showingStats = false;
 
 let eventSource = null;
 let previewEventSource = null;
@@ -38,8 +37,9 @@ document.addEventListener("DOMContentLoaded", () => {
     initLineSearch();
     initNotificationSettings();
     initStatusCheck();
-    document.getElementById("toggleViewBtn").addEventListener("click", toggleView);
-    document.getElementById("statsViewBtn").addEventListener("click", toggleStats);
+    document.getElementById("timelineViewBtn").addEventListener("click", () => setView('timeline'));
+    document.getElementById("mapViewBtn").addEventListener("click", () => setView('map'));
+    document.getElementById("statsViewBtn").addEventListener("click", () => setView('stats'));
     initVisibilityHandling();
 });
 
@@ -457,7 +457,7 @@ function resetApp() {
     patternPath = [];
     segmentDurations = {};
     heatmapData = {};
-    if (showingStats) toggleStats();
+    setView('timeline');
     clearInterval(durationRefreshInterval);
     durationRefreshInterval = null;
     resetMonitoringState();
@@ -676,10 +676,11 @@ async function refreshSegmentDurations() {
             const distSpan = el.querySelector('.seg-dist');
             const distHtml = distSpan ? distSpan.outerHTML : '';
             el.innerHTML = distHtml + (seg && seg.sample_count > 0 ? `
-                <span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)}</span>
-                <span class="seg-range">${formatDuration(seg.min_seconds)}–${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>
+                <span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)} /</span>
+                <span class="seg-range">${formatDuration(seg.min_seconds)} ${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>
             ` : '');
         });
+        if (currentView === 'stats') fetchAndRenderHeatmap();
     } catch (e) { /* non-critical */ }
 }
 
@@ -896,29 +897,23 @@ function handleMonitoringData(data) {
     }
 }
 
-// ---- Stats / Heatmap View ----
-function toggleStats() {
-    showingStats = !showingStats;
-    const statsView = document.getElementById('statsView');
+// ---- View switching ----
+function setView(view) {
+    currentView = view;
     const timelineContainer = document.querySelector('.route-timeline-container');
     const mapView = document.getElementById('mapView');
-    const btn = document.getElementById('statsViewBtn');
+    const statsView = document.getElementById('statsView');
 
-    if (showingStats) {
-        statsView.style.display = 'block';
-        timelineContainer.style.display = 'none';
-        mapView.style.display = 'none';
-        btn.classList.add('active');
-        fetchAndRenderHeatmap();
-    } else {
-        statsView.style.display = 'none';
-        btn.classList.remove('active');
-        if (currentView === 'map') {
-            mapView.style.display = 'flex';
-        } else {
-            timelineContainer.style.display = '';
-        }
-    }
+    timelineContainer.style.display = view === 'timeline' ? '' : 'none';
+    mapView.style.display        = view === 'map'      ? 'flex'  : 'none';
+    statsView.style.display      = view === 'stats'    ? 'block' : 'none';
+
+    document.getElementById('timelineViewBtn').classList.toggle('active', view === 'timeline');
+    document.getElementById('mapViewBtn').classList.toggle('active', view === 'map');
+    document.getElementById('statsViewBtn').classList.toggle('active', view === 'stats');
+
+    if (view === 'map') setTimeout(() => initMap(), 0);
+    if (view === 'stats') fetchAndRenderHeatmap();
 }
 
 async function fetchAndRenderHeatmap() {
@@ -986,20 +981,6 @@ function renderHeatmap() {
 }
 
 // ---- Map View ----
-function toggleView() {
-    if (showingStats) toggleStats();
-    const goingToMap = currentView === 'timeline';
-    currentView = goingToMap ? 'map' : 'timeline';
-
-    document.querySelector('.route-timeline-container').style.display = goingToMap ? 'none' : '';
-    document.getElementById('mapView').style.display = goingToMap ? 'flex' : 'none';
-    document.getElementById('toggleViewBtnText').textContent = goingToMap ? 'Timeline View' : 'Map View';
-
-    if (goingToMap) {
-        // Defer so the container is rendered before Leaflet initializes/resizes
-        setTimeout(() => initMap(), 0);
-    }
-}
 
 function initMap() {
     if (!map) {
