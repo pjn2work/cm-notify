@@ -272,54 +272,69 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
+def _segment_eta(sf: dict, st: dict, speed_ms: float, hist_data: dict,
+                 trip_schedule: Optional[dict]) -> float:
+    """Blended ETA in seconds for a single stop-pair segment."""
+    scheduled = None
+    if trip_schedule:
+        t_from = trip_schedule.get(sf["stop_id"])
+        t_to = trip_schedule.get(st["stop_id"])
+        if t_from is not None and t_to is not None and t_to > t_from:
+            scheduled = float(t_to - t_from)
+    hist = hist_data.get((sf["stop_id"], st["stop_id"]))
+    historical = hist["avg_seconds"] if hist else None
+    if scheduled is not None and historical is not None:
+        return 0.5 * scheduled + 0.5 * historical
+    if scheduled is not None:
+        return scheduled
+    if historical is not None:
+        return historical
+    raw_km = st.get("distance", 0) - sf.get("distance", 0)
+    if raw_km > 0:
+        seg_dist = raw_km * 1000
+    else:
+        lat1, lon1 = sf.get("lat"), sf.get("lon")
+        lat2, lon2 = st.get("lat"), st.get("lon")
+        seg_dist = _haversine_m(lat1, lon1, lat2, lon2) if lat1 and lon1 and lat2 and lon2 else 300.0
+    return seg_dist / speed_ms
+
+
 def calculate_eta_seconds(
     path_ordered: list, from_seq: int, to_seq: int,
     speed_ms: float, hist_data: dict,
     trip_schedule: Optional[dict] = None
 ) -> float:
-    """ETA in seconds. Priority per segment:
-      1. 50% schedule + 50% historical  (both available)
-      2. Schedule only
-      3. Historical only
-      4. Route distance / speed fallback
-    speed_ms is in m/s (as returned by the Carris vehicles API)."""
+    """Sum of blended ETAs for all segments from from_seq to to_seq."""
     if from_seq >= to_seq:
         return 0.0
-    speed_ms = max(speed_ms or 0, 10 / 3.6)  # floor at 10 km/h in m/s
+    speed_ms = max(speed_ms or 0, 10 / 3.6)
     steps = [s for s in path_ordered if from_seq <= s["stop_sequence"] <= to_seq]
-    total = 0.0
-    for i in range(len(steps) - 1):
-        sf, st = steps[i], steps[i + 1]
+    return sum(
+        _segment_eta(steps[i], steps[i + 1], speed_ms, hist_data, trip_schedule)
+        for i in range(len(steps) - 1)
+    )
 
-        scheduled = None
-        if trip_schedule:
-            t_from = trip_schedule.get(sf["stop_id"])
-            t_to = trip_schedule.get(st["stop_id"])
-            if t_from is not None and t_to is not None and t_to > t_from:
-                scheduled = float(t_to - t_from)
 
-        hist = hist_data.get((sf["stop_id"], st["stop_id"]))
-        historical = hist["avg_seconds"] if hist else None
-
-        if scheduled is not None and historical is not None:
-            segment_eta = 0.5 * scheduled + 0.5 * historical
-        elif scheduled is not None:
-            segment_eta = scheduled
-        elif historical is not None:
-            segment_eta = historical
-        else:
-            raw_km = st.get("distance", 0) - sf.get("distance", 0)
-            if raw_km > 0:
-                seg_dist = raw_km * 1000
-            else:
-                lat1, lon1 = sf.get("lat"), sf.get("lon")
-                lat2, lon2 = st.get("lat"), st.get("lon")
-                seg_dist = (_haversine_m(lat1, lon1, lat2, lon2)
-                            if lat1 and lon1 and lat2 and lon2 else 300.0)
-            segment_eta = seg_dist / speed_ms
-
-        total += segment_eta
-    return total
+def partial_segment_eta(path_ordered: list, current_seq: int, bus_lat: float, bus_lon: float,
+                        speed_ms: float, hist_data: dict, trip_schedule: Optional[dict]) -> float:
+    """Remaining ETA for the segment the bus is currently travelling through.
+    When IN_TRANSIT_TO stop N, the bus is somewhere between stop N-1 and stop N.
+    We compute: (haversine(bus → stop_N) / haversine(stop_N-1 → stop_N)) × full_segment_time."""
+    curr_step = next((s for s in path_ordered if s["stop_sequence"] == current_seq), None)
+    if not curr_step or not curr_step.get("lat") or not curr_step.get("lon"):
+        return 0.0
+    prev_candidates = [s for s in path_ordered if s["stop_sequence"] < current_seq]
+    if not prev_candidates:
+        return 0.0
+    prev_step = max(prev_candidates, key=lambda s: s["stop_sequence"])
+    dist_to_next = _haversine_m(bus_lat, bus_lon, curr_step["lat"], curr_step["lon"])
+    if prev_step.get("lat") and prev_step.get("lon"):
+        total_seg = _haversine_m(prev_step["lat"], prev_step["lon"], curr_step["lat"], curr_step["lon"])
+        fraction = min(dist_to_next / total_seg, 1.0) if total_seg > 0 else 0.5
+    else:
+        fraction = 0.5
+    speed_ms = max(speed_ms or 0, 10 / 3.6)
+    return fraction * _segment_eta(prev_step, curr_step, speed_ms, hist_data, trip_schedule)
 
 
 async def get_pattern_data(pattern_id: str) -> Optional[dict]:
@@ -636,12 +651,23 @@ async def monitor_pattern(
                         stops_to_destination = end_seq - current_seq if current_seq <= end_seq else -1
                         speed = v.get("speed") or 0  # m/s from Carris API
                         trip_schedule = TRIP_SCHEDULES.get(v.get("trip_id", ""))
+                        bus_status = v.get("current_status", "")
+                        bus_lat, bus_lon = v.get("lat"), v.get("lon")
+
+                        # Remaining time in the segment the bus is currently travelling through
+                        pre_eta = 0.0
+                        if bus_status in ("IN_TRANSIT_TO", "INCOMING_AT") and bus_lat and bus_lon:
+                            pre_eta = partial_segment_eta(
+                                path_ordered, current_seq, bus_lat, bus_lon,
+                                speed, hist_data, trip_schedule
+                            )
+
                         eta_to_start_seconds = (
-                            calculate_eta_seconds(path_ordered, current_seq, start_seq, speed, hist_data, trip_schedule)
-                            if current_seq < start_seq else None
+                            pre_eta + calculate_eta_seconds(path_ordered, current_seq, start_seq, speed, hist_data, trip_schedule)
+                            if current_seq <= start_seq else None
                         )
                         eta_to_end_seconds = (
-                            calculate_eta_seconds(path_ordered, current_seq, end_seq, speed, hist_data, trip_schedule)
+                            pre_eta + calculate_eta_seconds(path_ordered, current_seq, end_seq, speed, hist_data, trip_schedule)
                             if current_seq <= end_seq else None
                         )
                     else:
