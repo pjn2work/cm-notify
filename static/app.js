@@ -11,6 +11,8 @@ let endStopName = "";
 
 let segmentDurations = {};
 let durationRefreshInterval = null;
+let heatmapData = {};
+let showingStats = false;
 
 let eventSource = null;
 let previewEventSource = null;
@@ -37,6 +39,7 @@ document.addEventListener("DOMContentLoaded", () => {
     initNotificationSettings();
     initStatusCheck();
     document.getElementById("toggleViewBtn").addEventListener("click", toggleView);
+    document.getElementById("statsViewBtn").addEventListener("click", toggleStats);
     initVisibilityHandling();
 });
 
@@ -453,6 +456,8 @@ function resetApp() {
     selectedPattern = null;
     patternPath = [];
     segmentDurations = {};
+    heatmapData = {};
+    if (showingStats) toggleStats();
     clearInterval(durationRefreshInterval);
     durationRefreshInterval = null;
     resetMonitoringState();
@@ -891,8 +896,98 @@ function handleMonitoringData(data) {
     }
 }
 
+// ---- Stats / Heatmap View ----
+function toggleStats() {
+    showingStats = !showingStats;
+    const statsView = document.getElementById('statsView');
+    const timelineContainer = document.querySelector('.route-timeline-container');
+    const mapView = document.getElementById('mapView');
+    const btn = document.getElementById('statsViewBtn');
+
+    if (showingStats) {
+        statsView.style.display = 'block';
+        timelineContainer.style.display = 'none';
+        mapView.style.display = 'none';
+        btn.classList.add('active');
+        fetchAndRenderHeatmap();
+    } else {
+        statsView.style.display = 'none';
+        btn.classList.remove('active');
+        if (currentView === 'map') {
+            mapView.style.display = 'flex';
+        } else {
+            timelineContainer.style.display = '';
+        }
+    }
+}
+
+async function fetchAndRenderHeatmap() {
+    if (!selectedPattern) return;
+    const pythonDay = (new Date().getDay() + 6) % 7; // JS Sun=0 → Python Mon=0
+    try {
+        const res = await fetch(`/api/patterns/${selectedPattern.id}/heatmap?day=${pythonDay}`);
+        if (res.ok) {
+            heatmapData = await res.json();
+            renderHeatmap();
+        }
+    } catch (e) { /* non-critical */ }
+}
+
+function segmentColor(normalized) {
+    // Green (#10b981) = fast, Amber (#f59e0b) = slow
+    const r = Math.round(16  + normalized * (245 - 16));
+    const g = Math.round(185 + normalized * (158 - 185));
+    const b = Math.round(129 + normalized * (11  - 129));
+    return `rgba(${r},${g},${b},0.4)`;
+}
+
+function renderHeatmap() {
+    const container = document.getElementById('heatmapContainer');
+    const currentHour = new Date().getHours();
+    const pythonDay = (new Date().getDay() + 6) % 7;
+    const dayName = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][pythonDay];
+    const hours = Array.from({length: 24}, (_, i) => i);
+
+    let html = `<div class="heatmap-title">Travel time per segment — ${dayName}</div>`;
+    html += `<div class="heatmap-scroll"><table class="heatmap-table"><thead><tr>`;
+    html += `<th class="heatmap-stop-col">Stop</th>`;
+    hours.forEach(h => {
+        html += `<th class="heatmap-hour-col${h === currentHour ? ' heatmap-current-hour' : ''}">${String(h).padStart(2,'0')}</th>`;
+    });
+    html += `</tr></thead><tbody>`;
+
+    patternPath.forEach((step, idx) => {
+        if (idx === 0) return;
+        const prev = patternPath[idx - 1];
+        const key = `${prev.stop_id}__${step.stop_id}`;
+        const rowData = heatmapData[key] || {};
+
+        const values = hours.map(h => rowData[h]?.avg_seconds).filter(Boolean);
+        const rowMin = values.length ? Math.min(...values) : 0;
+        const rowMax = values.length ? Math.max(...values) : 0;
+
+        const distM = Math.round((step.distance - prev.distance) * 1000);
+        const distLabel = distM > 0 ? ` (${distM >= 1000 ? (distM/1000).toFixed(1)+'km' : distM+'m'})` : '';
+        html += `<tr><td class="heatmap-stop-label">${step.stop_sequence}.${distLabel} ${step.name}</td>`;
+        hours.forEach(h => {
+            const d = rowData[h];
+            if (d) {
+                const norm = rowMax > rowMin ? (d.avg_seconds - rowMin) / (rowMax - rowMin) : 0.5;
+                html += `<td class="heatmap-cell" style="background:${segmentColor(norm)}" title="${formatDuration(d.avg_seconds)} · ${d.sample_count} samples">${formatDuration(d.avg_seconds)}</td>`;
+            } else {
+                html += `<td class="heatmap-cell heatmap-empty"></td>`;
+            }
+        });
+        html += `</tr>`;
+    });
+
+    html += `</tbody></table></div>`;
+    container.innerHTML = html;
+}
+
 // ---- Map View ----
 function toggleView() {
+    if (showingStats) toggleStats();
     const goingToMap = currentView === 'timeline';
     currentView = goingToMap ? 'map' : 'timeline';
 

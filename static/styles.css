@@ -1154,6 +1154,108 @@ body {
     color: var(--text-secondary);
 }
 
+/* Active state for view toggle buttons */
+.view-toggle-btn.active {
+    background: rgba(99, 102, 241, 0.2);
+    border-color: var(--primary);
+    color: var(--primary-hover);
+}
+
+/* Stats / Heatmap View */
+#statsView {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: rgba(0, 0, 0, 0.15);
+    overflow: hidden;
+}
+
+.heatmap-title {
+    padding: 10px 16px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.heatmap-scroll {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: 520px;
+}
+
+.heatmap-table {
+    border-collapse: collapse;
+    font-size: 0.62rem;
+    white-space: nowrap;
+}
+
+.heatmap-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #0b0f1e;
+    padding: 5px 3px;
+    text-align: center;
+    color: var(--text-muted);
+    font-weight: 600;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.heatmap-stop-col {
+    position: sticky;
+    left: 0;
+    z-index: 3 !important;
+    text-align: left !important;
+    padding-left: 12px !important;
+    min-width: 190px;
+    background: #0b0f1e !important;
+}
+
+.heatmap-hour-col {
+    min-width: 30px;
+}
+
+.heatmap-current-hour {
+    color: var(--primary-hover) !important;
+    background: rgba(99, 102, 241, 0.15) !important;
+}
+
+.heatmap-table tbody tr {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+}
+
+.heatmap-table tbody tr:hover td {
+    filter: brightness(1.25);
+}
+
+.heatmap-stop-label {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: #0b0f1e;
+    padding: 4px 12px;
+    color: var(--text-secondary);
+    font-size: 0.67rem;
+    max-width: 190px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.heatmap-cell {
+    text-align: center;
+    padding: 4px 3px;
+    color: rgba(248, 250, 252, 0.9);
+    font-weight: 500;
+    cursor: default;
+    min-width: 30px;
+}
+
+.heatmap-empty {
+    background: transparent !important;
+}
+
 /* Segment historical stats strip between timeline stops */
 .timeline-segment-info {
     display: flex;

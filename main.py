@@ -435,6 +435,25 @@ async def get_pattern_durations(pattern_id: str):
     }
 
 
+@app.get("/api/patterns/{pattern_id}/heatmap")
+async def get_pattern_heatmap(pattern_id: str, day: int = Query(..., ge=0, le=6)):
+    """Per-hour average duration for each stop pair on a given day of week."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT stop_from_id, stop_to_id, hour, avg_seconds, sample_count
+            FROM stop_durations
+            WHERE pattern_id = ? AND day_of_week = ?
+        """, (pattern_id, day)) as cursor:
+            rows = await cursor.fetchall()
+    result = {}
+    for stop_from, stop_to, hour, avg_sec, samples in rows:
+        key = f"{stop_from}__{stop_to}"
+        if key not in result:
+            result[key] = {}
+        result[key][hour] = {"avg_seconds": avg_sec, "sample_count": samples}
+    return result
+
+
 @app.get("/api/monitor")
 async def monitor_pattern(
     pattern_id: str = Query(...),
