@@ -42,6 +42,7 @@ VEHICLES_LAST_UPDATED: float = 0.0
 CACHE_LOCK = asyncio.Lock()
 ACTIVE_SSE_CLIENTS: int = 0
 DB_PATH = "stop_durations.db"
+DB_WRITE_LOCK = asyncio.Lock()
 ALL_ADJACENT_PAIRS: set = set()   # (stop_from_id, stop_to_id) across all patterns
 TRIP_SCHEDULES: Dict[str, Dict[str, int]] = {}  # trip_id -> {stop_id: seconds_since_midnight}
 _PATTERN_BULK_LOAD_DONE: bool = False
@@ -192,6 +193,7 @@ async def _ensure_pattern_cached(pattern_id: str):
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         # Detect and drop old schema that included pattern_id in the primary key
         async with db.execute("PRAGMA table_info(stop_durations)") as cur:
             cols = [row[1] for row in await cur.fetchall()]
@@ -217,17 +219,18 @@ async def init_db():
 
 async def record_stop_transition(stop_from: str, stop_to: str, timestamp: float, duration_seconds: float):
     dt = datetime.fromtimestamp(timestamp)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO stop_durations (stop_from_id, stop_to_id, day_of_week, hour, avg_seconds, min_seconds, max_seconds, sample_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(stop_from_id, stop_to_id, day_of_week, hour) DO UPDATE SET
-                avg_seconds = (avg_seconds * sample_count + excluded.avg_seconds) / (sample_count + 1),
-                min_seconds = MIN(COALESCE(min_seconds, excluded.min_seconds), excluded.min_seconds),
-                max_seconds = MAX(COALESCE(max_seconds, excluded.max_seconds), excluded.max_seconds),
-                sample_count = sample_count + 1
-        """, (stop_from, stop_to, dt.weekday(), dt.hour, duration_seconds, duration_seconds, duration_seconds))
-        await db.commit()
+    async with DB_WRITE_LOCK:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO stop_durations (stop_from_id, stop_to_id, day_of_week, hour, avg_seconds, min_seconds, max_seconds, sample_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(stop_from_id, stop_to_id, day_of_week, hour) DO UPDATE SET
+                    avg_seconds = (avg_seconds * sample_count + excluded.avg_seconds) / (sample_count + 1),
+                    min_seconds = MIN(COALESCE(min_seconds, excluded.min_seconds), excluded.min_seconds),
+                    max_seconds = MAX(COALESCE(max_seconds, excluded.max_seconds), excluded.max_seconds),
+                    sample_count = sample_count + 1
+            """, (stop_from, stop_to, dt.weekday(), dt.hour, duration_seconds, duration_seconds, duration_seconds))
+            await db.commit()
 
 
 async def get_pattern_historical_data(pattern_id: str, day: int, hour: int) -> dict:

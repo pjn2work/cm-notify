@@ -278,6 +278,7 @@ async function selectPattern(pattern) {
         
         // Render Timeline
         renderTimeline(patternPath);
+        if (currentView === 'stats') fetchAndRenderHeatmap();
 
         // Draw route on map if already initialized
         if (map) drawRouteOnMap();
