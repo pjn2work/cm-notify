@@ -7,6 +7,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+import math
+import time
+from datetime import datetime
+import aiosqlite
 
 # Setup logging
 logging.basicConfig(
@@ -37,6 +41,16 @@ VEHICLES_BY_PATTERN: Dict[str, List[dict]] = {}
 VEHICLES_LAST_UPDATED: float = 0.0
 CACHE_LOCK = asyncio.Lock()
 ACTIVE_SSE_CLIENTS: int = 0
+_db_dir = os.getenv("DB_DIR", "./data")
+os.makedirs(_db_dir, exist_ok=True)
+DB_PATH = os.path.join(_db_dir, "stop_durations.db")
+DB_WRITE_LOCK = asyncio.Lock()
+ALL_ADJACENT_PAIRS: set = set()   # (stop_from_id, stop_to_id) across all patterns
+TRIP_SCHEDULES: Dict[str, Dict[str, int]] = {}  # trip_id -> {stop_id: seconds_since_midnight}
+_PATTERN_BULK_LOAD_DONE: bool = False
+VEHICLE_PREV_STOP: Dict[str, dict] = {}
+PATTERNS_FETCH_QUEUED: set = set()
+_PATTERN_FETCH_SEM: Optional[asyncio.Semaphore] = None
 
 API_BASE_URL = "https://api.carrismetropolitana.pt/v2"
 HTTP_HEADERS = {"User-Agent": "CarrisMetropolitanaBusNotifier/1.0"}
@@ -94,6 +108,38 @@ async def update_vehicles_data(client: httpx.AsyncClient) -> bool:
                         by_pattern[p_id] = []
                     by_pattern[p_id].append(v)
             
+            now = time.time()
+            for v in vehicles:
+                vid = v.get("id")
+                curr_stop = v.get("stop_id")
+                p_id = v.get("pattern_id")
+                if not vid or not curr_stop or not p_id:
+                    continue
+
+                # Fetch any pattern we haven't seen yet — new buses starting shifts
+                # bring new pattern IDs that must be cached immediately.
+                if p_id not in PATTERNS_CACHE and p_id not in PATTERNS_FETCH_QUEUED:
+                    PATTERNS_FETCH_QUEUED.add(p_id)
+                    asyncio.create_task(_ensure_pattern_cached(p_id))
+
+                status = v.get("current_status", "")
+                prev = VEHICLE_PREV_STOP.get(vid)
+                stop_changed = prev and prev["stop_id"] != curr_stop and prev["pattern_id"] == p_id
+
+                if stop_changed and status == "STOPPED_AT":
+                    # Bus has fully arrived at a new stop — record duration from when
+                    # it first appeared at the previous stop to now.
+                    duration = now - prev["timestamp"]
+                    if (prev["stop_id"], curr_stop) in ALL_ADJACENT_PAIRS and 30 < duration < 1800:
+                        asyncio.create_task(record_stop_transition(
+                            prev["stop_id"], curr_stop, prev["timestamp"], duration
+                        ))
+                    VEHICLE_PREV_STOP[vid] = {"stop_id": curr_stop, "timestamp": now, "pattern_id": p_id}
+                elif not prev or prev["pattern_id"] != p_id:
+                    # First time seeing this vehicle (or it switched pattern): start tracking.
+                    VEHICLE_PREV_STOP[vid] = {"stop_id": curr_stop, "timestamp": now, "pattern_id": p_id}
+                # else: same stop (or not STOPPED_AT yet) → preserve first-seen timestamp
+
             async with CACHE_LOCK:
                 VEHICLES_BY_PATTERN = by_pattern
                 VEHICLES_LAST_UPDATED = asyncio.get_event_loop().time()
@@ -103,6 +149,19 @@ async def update_vehicles_data(client: httpx.AsyncClient) -> bool:
     except Exception as e:
         logger.error(f"Exception updating vehicles: {e}")
     return False
+
+async def background_pattern_refresher():
+    """Clear pattern caches every 24 hours so schedules and routes stay current."""
+    while True:
+        await asyncio.sleep(24 * 3600)
+        global _PATTERN_BULK_LOAD_DONE
+        PATTERNS_CACHE.clear()
+        PATTERNS_FETCH_QUEUED.clear()
+        ALL_ADJACENT_PAIRS.clear()
+        TRIP_SCHEDULES.clear()
+        _PATTERN_BULK_LOAD_DONE = False
+        logger.info("Pattern cache cleared — will repopulate on next vehicle poll.")
+
 
 async def background_vehicle_poller():
     """Background task to poll vehicle positions every 10 seconds, only when clients are connected."""
@@ -114,6 +173,175 @@ async def background_vehicle_poller():
                 await update_vehicles_data(client)
             await asyncio.sleep(10.0)
 
+async def _ensure_pattern_cached(pattern_id: str):
+    """Fetch and cache a pattern (including adjacency set) with concurrency limit."""
+    global _PATTERN_BULK_LOAD_DONE
+    async with _PATTERN_FETCH_SEM:
+        if pattern_id not in PATTERNS_CACHE:
+            if not _PATTERN_BULK_LOAD_DONE:
+                done = sum(1 for p in PATTERNS_FETCH_QUEUED if p in PATTERNS_CACHE)
+                total = len(PATTERNS_FETCH_QUEUED)
+                pct = round(done / total * 100) if total else 0
+                logger.info(f"Pattern cache: {done}/{total} ({pct}%) — fetching {pattern_id}")
+            await get_pattern_data(pattern_id)
+
+    if not _PATTERN_BULK_LOAD_DONE:
+        done = sum(1 for p in PATTERNS_FETCH_QUEUED if p in PATTERNS_CACHE)
+        total = len(PATTERNS_FETCH_QUEUED)
+        if done >= total:
+            _PATTERN_BULK_LOAD_DONE = True
+            logger.info(f"Pattern cache complete: {total} patterns loaded.")
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        # Detect and drop old schema that included pattern_id in the primary key
+        async with db.execute("PRAGMA table_info(stop_durations)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        if "pattern_id" in cols:
+            logger.info("Migrating stop_durations: dropping pattern_id-keyed schema.")
+            await db.execute("DROP TABLE stop_durations")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stop_durations (
+                stop_from_id TEXT,
+                stop_to_id TEXT,
+                day_of_week INTEGER,
+                hour INTEGER,
+                avg_seconds REAL,
+                min_seconds REAL,
+                max_seconds REAL,
+                sample_count INTEGER,
+                PRIMARY KEY (stop_from_id, stop_to_id, day_of_week, hour)
+            )
+        """)
+        await db.commit()
+    logger.info("SQLite ETA database initialized.")
+
+
+async def record_stop_transition(stop_from: str, stop_to: str, timestamp: float, duration_seconds: float):
+    dt = datetime.fromtimestamp(timestamp)
+    async with DB_WRITE_LOCK:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO stop_durations (stop_from_id, stop_to_id, day_of_week, hour, avg_seconds, min_seconds, max_seconds, sample_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(stop_from_id, stop_to_id, day_of_week, hour) DO UPDATE SET
+                    avg_seconds = (avg_seconds * sample_count + excluded.avg_seconds) / (sample_count + 1),
+                    min_seconds = MIN(COALESCE(min_seconds, excluded.min_seconds), excluded.min_seconds),
+                    max_seconds = MAX(COALESCE(max_seconds, excluded.max_seconds), excluded.max_seconds),
+                    sample_count = sample_count + 1
+            """, (stop_from, stop_to, dt.weekday(), dt.hour, duration_seconds, duration_seconds, duration_seconds))
+            await db.commit()
+
+
+async def get_pattern_historical_data(pattern_id: str, day: int, hour: int) -> dict:
+    pattern = PATTERNS_CACHE.get(pattern_id)
+    if not pattern:
+        return {}
+    path = sorted(pattern.get("path", []), key=lambda s: s["stop_sequence"])
+    pair_keys = [f"{path[i]['stop_id']}__{path[i+1]['stop_id']}" for i in range(len(path) - 1)]
+    if not pair_keys:
+        return {}
+    placeholders = ",".join(["?"] * len(pair_keys))
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(f"""
+            SELECT stop_from_id, stop_to_id, avg_seconds, min_seconds, max_seconds, sample_count
+            FROM stop_durations
+            WHERE day_of_week = ? AND hour = ?
+            AND stop_from_id || '__' || stop_to_id IN ({placeholders})
+        """, [day, hour] + pair_keys) as cursor:
+            rows = await cursor.fetchall()
+    return {
+        (row[0], row[1]): {
+            "avg_seconds": row[2], "min_seconds": row[3],
+            "max_seconds": row[4], "sample_count": row[5]
+        }
+        for row in rows
+    }
+
+
+def _parse_time_s(t: str) -> int:
+    """Parse HH:MM:SS (including >24h overnight values) to seconds since midnight."""
+    h, m, s = t.split(":")
+    return int(h) * 3600 + int(m) * 60 + int(s)
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two GPS coordinates."""
+    R = 6_371_000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _segment_eta(sf: dict, st: dict, speed_ms: float, hist_data: dict,
+                 trip_schedule: Optional[dict]) -> float:
+    """Blended ETA in seconds for a single stop-pair segment."""
+    scheduled = None
+    if trip_schedule:
+        t_from = trip_schedule.get(sf["stop_id"])
+        t_to = trip_schedule.get(st["stop_id"])
+        if t_from is not None and t_to is not None and t_to > t_from:
+            scheduled = float(t_to - t_from)
+    hist = hist_data.get((sf["stop_id"], st["stop_id"]))
+    historical = hist["avg_seconds"] if hist else None
+    if scheduled is not None and historical is not None:
+        return 0.5 * scheduled + 0.5 * historical
+    if scheduled is not None:
+        return scheduled
+    if historical is not None:
+        return historical
+    raw_km = st.get("distance", 0) - sf.get("distance", 0)
+    if raw_km > 0:
+        seg_dist = raw_km * 1000
+    else:
+        lat1, lon1 = sf.get("lat"), sf.get("lon")
+        lat2, lon2 = st.get("lat"), st.get("lon")
+        seg_dist = _haversine_m(lat1, lon1, lat2, lon2) if lat1 and lon1 and lat2 and lon2 else 300.0
+    return seg_dist / speed_ms
+
+
+def calculate_eta_seconds(
+    path_ordered: list, from_seq: int, to_seq: int,
+    speed_ms: float, hist_data: dict,
+    trip_schedule: Optional[dict] = None
+) -> float:
+    """Sum of blended ETAs for all segments from from_seq to to_seq."""
+    if from_seq >= to_seq:
+        return 0.0
+    speed_ms = max(speed_ms or 0, 10 / 3.6)
+    steps = [s for s in path_ordered if from_seq <= s["stop_sequence"] <= to_seq]
+    return sum(
+        _segment_eta(steps[i], steps[i + 1], speed_ms, hist_data, trip_schedule)
+        for i in range(len(steps) - 1)
+    )
+
+
+def partial_segment_eta(path_ordered: list, current_seq: int, bus_lat: float, bus_lon: float,
+                        speed_ms: float, hist_data: dict, trip_schedule: Optional[dict]) -> float:
+    """Remaining ETA for the segment the bus is currently travelling through.
+    When IN_TRANSIT_TO stop N, the bus is somewhere between stop N-1 and stop N.
+    We compute: (haversine(bus → stop_N) / haversine(stop_N-1 → stop_N)) × full_segment_time."""
+    curr_step = next((s for s in path_ordered if s["stop_sequence"] == current_seq), None)
+    if not curr_step or not curr_step.get("lat") or not curr_step.get("lon"):
+        return 0.0
+    prev_candidates = [s for s in path_ordered if s["stop_sequence"] < current_seq]
+    if not prev_candidates:
+        return 0.0
+    prev_step = max(prev_candidates, key=lambda s: s["stop_sequence"])
+    dist_to_next = _haversine_m(bus_lat, bus_lon, curr_step["lat"], curr_step["lon"])
+    if prev_step.get("lat") and prev_step.get("lon"):
+        total_seg = _haversine_m(prev_step["lat"], prev_step["lon"], curr_step["lat"], curr_step["lon"])
+        fraction = min(dist_to_next / total_seg, 1.0) if total_seg > 0 else 0.5
+    else:
+        fraction = 0.5
+    speed_ms = max(speed_ms or 0, 10 / 3.6)
+    return fraction * _segment_eta(prev_step, curr_step, speed_ms, hist_data, trip_schedule)
+
+
 async def get_pattern_data(pattern_id: str) -> Optional[dict]:
     """Retrieve pattern details, using cache if available."""
     if pattern_id in PATTERNS_CACHE:
@@ -121,7 +349,6 @@ async def get_pattern_data(pattern_id: str) -> Optional[dict]:
 
     async with httpx.AsyncClient() as client:
         try:
-            logger.info(f"Fetching pattern {pattern_id} from API...")
             response = await client.get(f"{API_BASE_URL}/patterns/{pattern_id}", headers=HTTP_HEADERS, timeout=15.0)
             if response.status_code == 200:
                 data = response.json()
@@ -130,6 +357,17 @@ async def get_pattern_data(pattern_id: str) -> Optional[dict]:
                 else:
                     pattern = data
                 PATTERNS_CACHE[pattern_id] = pattern
+                sorted_path = sorted(pattern.get("path", []), key=lambda s: s["stop_sequence"])
+                for i in range(len(sorted_path) - 1):
+                    ALL_ADJACENT_PAIRS.add((sorted_path[i]["stop_id"], sorted_path[i + 1]["stop_id"]))
+                for trip in pattern.get("trips", []):
+                    sched = {
+                        entry["stop_id"]: _parse_time_s(entry["arrival_time_24h"])
+                        for entry in trip.get("schedule", [])
+                        if entry.get("arrival_time_24h")
+                    }
+                    for tid in trip.get("trip_ids", []):
+                        TRIP_SCHEDULES[tid] = sched
                 return pattern
             else:
                 logger.error(f"Failed to fetch pattern {pattern_id}: HTTP {response.status_code}")
@@ -140,6 +378,9 @@ async def get_pattern_data(pattern_id: str) -> Optional[dict]:
 @app.on_event("startup")
 async def startup_event():
     """Load static datasets and launch background poller on server startup."""
+    global _PATTERN_FETCH_SEM
+    _PATTERN_FETCH_SEM = asyncio.Semaphore(5)
+    await init_db()
     async with httpx.AsyncClient() as client:
         # Load core static datasets
         lines_success = await fetch_lines_data(client)
@@ -150,6 +391,7 @@ async def startup_event():
         
         # We start the background tasks
         asyncio.create_task(background_vehicle_poller())
+        asyncio.create_task(background_pattern_refresher())
 
 @app.get("/api/lines")
 async def get_lines(search: Optional[str] = None):
@@ -270,6 +512,66 @@ async def get_shape(shape_id: str):
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/patterns/{pattern_id}/durations")
+async def get_pattern_durations(pattern_id: str):
+    """Aggregated historical stop-pair durations for a pattern across all day/hour slots."""
+    pattern = PATTERNS_CACHE.get(pattern_id) or await get_pattern_data(pattern_id)
+    if not pattern:
+        return {}
+    path = sorted(pattern.get("path", []), key=lambda s: s["stop_sequence"])
+    pair_keys = [f"{path[i]['stop_id']}__{path[i+1]['stop_id']}" for i in range(len(path) - 1)]
+    if not pair_keys:
+        return {}
+    placeholders = ",".join(["?"] * len(pair_keys))
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(f"""
+            SELECT stop_from_id, stop_to_id,
+                SUM(avg_seconds * sample_count) / SUM(sample_count) AS overall_avg,
+                MIN(min_seconds) AS overall_min,
+                MAX(max_seconds) AS overall_max,
+                SUM(sample_count) AS total_samples
+            FROM stop_durations
+            WHERE stop_from_id || '__' || stop_to_id IN ({placeholders})
+            GROUP BY stop_from_id, stop_to_id
+        """, pair_keys) as cursor:
+            rows = await cursor.fetchall()
+    return {
+        f"{row[0]}__{row[1]}": {
+            "avg_seconds": row[2], "min_seconds": row[3],
+            "max_seconds": row[4], "sample_count": int(row[5])
+        }
+        for row in rows
+    }
+
+
+@app.get("/api/patterns/{pattern_id}/heatmap")
+async def get_pattern_heatmap(pattern_id: str, day: int = Query(..., ge=0, le=6)):
+    """Per-hour average duration for each stop pair on a given day of week."""
+    pattern = PATTERNS_CACHE.get(pattern_id) or await get_pattern_data(pattern_id)
+    if not pattern:
+        return {}
+    path = sorted(pattern.get("path", []), key=lambda s: s["stop_sequence"])
+    pair_keys = [f"{path[i]['stop_id']}__{path[i+1]['stop_id']}" for i in range(len(path) - 1)]
+    if not pair_keys:
+        return {}
+    placeholders = ",".join(["?"] * len(pair_keys))
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(f"""
+            SELECT stop_from_id, stop_to_id, hour, avg_seconds, sample_count
+            FROM stop_durations
+            WHERE day_of_week = ?
+            AND stop_from_id || '__' || stop_to_id IN ({placeholders})
+        """, [day] + pair_keys) as cursor:
+            rows = await cursor.fetchall()
+    result = {}
+    for stop_from, stop_to, hour, avg_sec, samples in rows:
+        key = f"{stop_from}__{stop_to}"
+        if key not in result:
+            result[key] = {}
+        result[key][hour] = {"avg_seconds": avg_sec, "sample_count": samples}
+    return result
+
+
 @app.get("/api/monitor")
 async def monitor_pattern(
     pattern_id: str = Query(...),
@@ -290,6 +592,16 @@ async def monitor_pattern(
 
             path = pattern.get("path", [])
             stop_seqs = {step["stop_id"]: step["stop_sequence"] for step in path}
+            # Enrich with stop coordinates so haversine can compute accurate distances
+            path_ordered = sorted(
+                [
+                    {**step,
+                     "lat": STOPS_CACHE.get(step["stop_id"], {}).get("lat"),
+                     "lon": STOPS_CACHE.get(step["stop_id"], {}).get("lon")}
+                    for step in path
+                ],
+                key=lambda s: s["stop_sequence"]
+            )
 
             has_alert_zone = start_stop_id is not None and end_stop_id is not None
             start_seq = None
@@ -326,6 +638,9 @@ async def monitor_pattern(
                     vehicles = VEHICLES_BY_PATTERN.get(pattern_id, [])
                     last_updated = VEHICLES_LAST_UPDATED
 
+                now_dt = datetime.now()
+                hist_data = await get_pattern_historical_data(pattern_id, now_dt.weekday(), now_dt.hour)
+
                 monitored_buses = []
                 for v in vehicles:
                     stop_id = v.get("stop_id")
@@ -339,10 +654,33 @@ async def monitor_pattern(
                         is_in_alert_zone = start_seq <= current_seq <= end_seq
                         stops_to_start = start_seq - current_seq if current_seq < start_seq else 0
                         stops_to_destination = end_seq - current_seq if current_seq <= end_seq else -1
+                        speed = v.get("speed") or 0  # m/s from Carris API
+                        trip_schedule = TRIP_SCHEDULES.get(v.get("trip_id", ""))
+                        bus_status = v.get("current_status", "")
+                        bus_lat, bus_lon = v.get("lat"), v.get("lon")
+
+                        # Remaining time in the segment the bus is currently travelling through
+                        pre_eta = 0.0
+                        if bus_status in ("IN_TRANSIT_TO", "INCOMING_AT") and bus_lat and bus_lon:
+                            pre_eta = partial_segment_eta(
+                                path_ordered, current_seq, bus_lat, bus_lon,
+                                speed, hist_data, trip_schedule
+                            )
+
+                        eta_to_start_seconds = (
+                            pre_eta + calculate_eta_seconds(path_ordered, current_seq, start_seq, speed, hist_data, trip_schedule)
+                            if current_seq <= start_seq else None
+                        )
+                        eta_to_end_seconds = (
+                            pre_eta + calculate_eta_seconds(path_ordered, current_seq, end_seq, speed, hist_data, trip_schedule)
+                            if current_seq <= end_seq else None
+                        )
                     else:
                         is_in_alert_zone = False
                         stops_to_start = 0
                         stops_to_destination = -1
+                        eta_to_start_seconds = None
+                        eta_to_end_seconds = None
 
                     stop_info = STOPS_CACHE.get(stop_id, {})
                     stop_name = stop_info.get("long_name", f"Stop {stop_id}")
@@ -361,6 +699,8 @@ async def monitor_pattern(
                         "is_in_alert_zone": is_in_alert_zone,
                         "stops_to_start": stops_to_start,
                         "stops_to_destination": stops_to_destination,
+                        "eta_to_start_seconds": round(eta_to_start_seconds) if eta_to_start_seconds is not None else None,
+                        "eta_to_end_seconds": round(eta_to_end_seconds) if eta_to_end_seconds is not None else None,
                         "make": v.get("make", ""),
                         "model": v.get("model", ""),
                         "owner": v.get("owner", ""),

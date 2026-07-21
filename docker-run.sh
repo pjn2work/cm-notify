@@ -20,6 +20,7 @@ docker run -d \
     --name "$CONTAINER_NAME" \
     -p "${PORT}:${PORT}" \
     --restart unless-stopped \
+    -v "$(dirname "${BASH_SOURCE[0]}")/stop_durations.db:/app/stop_durations.db" \
     "$IMAGE_NAME"
 
 echo "Done. Logs: docker logs -f ${CONTAINER_NAME}"

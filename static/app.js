@@ -9,6 +9,10 @@ let endStopId = null;
 let endStopSeq = null;
 let endStopName = "";
 
+let segmentDurations = {};
+let durationRefreshInterval = null;
+let heatmapData = {};
+
 let eventSource = null;
 let previewEventSource = null;
 let alertedVehicles = new Set();
@@ -33,7 +37,9 @@ document.addEventListener("DOMContentLoaded", () => {
     initLineSearch();
     initNotificationSettings();
     initStatusCheck();
-    document.getElementById("toggleViewBtn").addEventListener("click", toggleView);
+    document.getElementById("timelineViewBtn").addEventListener("click", () => setView('timeline'));
+    document.getElementById("mapViewBtn").addEventListener("click", () => setView('map'));
+    document.getElementById("statsViewBtn").addEventListener("click", () => setView('stats'));
     initVisibilityHandling();
 });
 
@@ -238,6 +244,15 @@ async function selectPattern(pattern) {
         const data = await res.json();
         patternPath = data.path;
 
+        // Fetch historical segment durations and keep them refreshed
+        segmentDurations = {};
+        try {
+            const durRes = await fetch(`/api/patterns/${pattern.id}/durations`);
+            if (durRes.ok) segmentDurations = await durRes.json();
+        } catch (e) { /* non-critical */ }
+        clearInterval(durationRefreshInterval);
+        durationRefreshInterval = setInterval(refreshSegmentDurations, 30000);
+
         // Fetch shape geometry for accurate map route rendering
         patternShape = null;
         if (data.shape_id) {
@@ -263,6 +278,7 @@ async function selectPattern(pattern) {
         
         // Render Timeline
         renderTimeline(patternPath);
+        if (currentView === 'stats') fetchAndRenderHeatmap();
 
         // Draw route on map if already initialized
         if (map) drawRouteOnMap();
@@ -317,8 +333,33 @@ function renderTimeline(path) {
         });
         
         container.appendChild(node);
+
+        // Segment info strip between this stop and the next
+        if (idx < path.length - 1) {
+            const nextStep = path[idx + 1];
+            const distM = Math.round((nextStep.distance - step.distance) * 1000);
+            const distText = distM >= 1000
+                ? `${(distM / 1000).toFixed(1)} km`
+                : distM > 0 ? `${distM} m` : null;
+
+            const key = `${step.stop_id}__${nextStep.stop_id}`;
+            const seg = segmentDurations[key];
+            const hasSeg = seg && seg.sample_count > 0;
+
+            if (distText || hasSeg) {
+                const segEl = document.createElement("div");
+                segEl.className = "timeline-segment-info";
+                segEl.dataset.segKey = key;
+                segEl.innerHTML = `
+                    ${distText ? `<span class="seg-dist">${distText}</span>` : ""}
+                    ${hasSeg ? `<span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)}</span>` : ""}
+                    ${hasSeg ? `<span class="seg-range">${formatDuration(seg.min_seconds)}–${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>` : ""}
+                `;
+                container.appendChild(segEl);
+            }
+        }
     });
-    
+
     updateTimelineHighlight();
 }
 
@@ -415,6 +456,11 @@ function resetApp() {
     selectedLine = null;
     selectedPattern = null;
     patternPath = [];
+    segmentDurations = {};
+    heatmapData = {};
+    setView('timeline');
+    clearInterval(durationRefreshInterval);
+    durationRefreshInterval = null;
     resetMonitoringState();
     
     document.getElementById("directionGroup").style.display = "none";
@@ -620,6 +666,44 @@ function stopMonitoring() {
     alertedVehicles.clear();
 }
 
+async function refreshSegmentDurations() {
+    if (!selectedPattern) return;
+    try {
+        const res = await fetch(`/api/patterns/${selectedPattern.id}/durations`);
+        if (!res.ok) return;
+        segmentDurations = await res.json();
+        document.querySelectorAll('.timeline-segment-info[data-seg-key]').forEach(el => {
+            const seg = segmentDurations[el.dataset.segKey];
+            const distSpan = el.querySelector('.seg-dist');
+            const distHtml = distSpan ? distSpan.outerHTML : '';
+            el.innerHTML = distHtml + (seg && seg.sample_count > 0 ? `
+                <span class="seg-avg">⌀ ${formatDuration(seg.avg_seconds)} /</span>
+                <span class="seg-range">${formatDuration(seg.min_seconds)} ${formatDuration(seg.max_seconds)} · ${seg.sample_count}</span>
+            ` : '');
+        });
+        if (currentView === 'stats') fetchAndRenderHeatmap();
+    } catch (e) { /* non-critical */ }
+}
+
+function formatEta(seconds) {
+    if (seconds == null) return null;
+    const mins = Math.round(seconds / 60);
+    if (mins <= 0) return "now";
+    return `~${mins} min`;
+}
+
+function etaArrivalTime(seconds) {
+    if (seconds == null) return null;
+    const t = new Date(Date.now() + seconds * 1000);
+    return t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDuration(seconds) {
+    if (seconds == null) return "?";
+    const mins = Math.round(seconds / 60);
+    return mins < 1 ? "<1m" : `${mins}m`;
+}
+
 // Handle Real-Time Updates
 function handleMonitoringData(data) {
     // 1. Update buses count
@@ -701,9 +785,15 @@ function handleMonitoringData(data) {
             
             const isExpanded = expandedBuses.has(bus.vehicle_id);
             
+            const etaStart = formatEta(bus.eta_to_start_seconds);
+            const etaStartTime = etaArrivalTime(bus.eta_to_start_seconds);
+            const etaEnd = formatEta(bus.eta_to_end_seconds);
+            const etaEndTime = etaArrivalTime(bus.eta_to_end_seconds);
             tooltip.innerHTML = `
                 <div class="bus-details${isExpanded ? ' open' : ''}">
                     <span class="bus-detail">${(bus.speed !== undefined && bus.speed !== null) ? Number(bus.speed).toFixed(1) : "0"} km/h • ${displayStatus}</span>
+                    ${etaStart ? `<span class="bus-detail" style="color:#f59e0b;font-weight:600">Your stop: ${etaStart} · ${etaStartTime}</span>` : ""}
+                    ${etaEnd ? `<span class="bus-detail" style="color:#10b981;font-weight:600">Destination: ${etaEnd} · ${etaEndTime}</span>` : ""}
                     ${bus.make ? `<span class="bus-detail">${bus.make} - ${bus.owner} - ${bus.propulsion}</span>` : ""}
                     <span class="bus-detail">ID: ${bus.vehicle_id}  •  Capacity: ${bus.capacity_total}  •  Contactless: ${bus.contactless}  •  Wheelchair: ${bus.wheelchair_accessible}  •  Bikes: ${bus.bikes_allowed}</span>
                 </div>
@@ -768,7 +858,8 @@ function handleMonitoringData(data) {
             
             const stopsLeft = bus.stops_to_destination;
             let stopsText = stopsLeft === 0 ? "arriving at your stop!" : `approaching! ${stopsLeft} stop${stopsLeft > 1 ? "s" : ""} left.`;
-            
+            const etaDestText = formatEta(bus.eta_to_end_seconds);
+
             banner.innerHTML = `
                 <div class="alert-icon">
                     <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none">
@@ -779,7 +870,7 @@ function handleMonitoringData(data) {
                 </div>
                 <div class="alert-message">
                     <span class="headline">Bus approaching! (${bus.license_plate})</span>
-                    <span class="description">Currently at <strong>${bus.current_stop_name}</strong> (${bus.current_status}) • ${stopsText}</span>
+                    <span class="description">Currently at <strong>${bus.current_stop_name}</strong> (${bus.current_status}) • ${stopsText}${etaDestText ? ` Destination in <strong>${etaDestText}</strong>.` : ""}</span>
                 </div>
             `;
             alertsContainer.appendChild(banner);
@@ -807,20 +898,90 @@ function handleMonitoringData(data) {
     }
 }
 
-// ---- Map View ----
-function toggleView() {
-    const goingToMap = currentView === 'timeline';
-    currentView = goingToMap ? 'map' : 'timeline';
+// ---- View switching ----
+function setView(view) {
+    currentView = view;
+    const timelineContainer = document.querySelector('.route-timeline-container');
+    const mapView = document.getElementById('mapView');
+    const statsView = document.getElementById('statsView');
 
-    document.querySelector('.route-timeline-container').style.display = goingToMap ? 'none' : '';
-    document.getElementById('mapView').style.display = goingToMap ? 'flex' : 'none';
-    document.getElementById('toggleViewBtnText').textContent = goingToMap ? 'Timeline View' : 'Map View';
+    timelineContainer.style.display = view === 'timeline' ? '' : 'none';
+    mapView.style.display        = view === 'map'      ? 'flex'  : 'none';
+    statsView.style.display      = view === 'stats'    ? 'block' : 'none';
 
-    if (goingToMap) {
-        // Defer so the container is rendered before Leaflet initializes/resizes
-        setTimeout(() => initMap(), 0);
-    }
+    document.getElementById('timelineViewBtn').classList.toggle('active', view === 'timeline');
+    document.getElementById('mapViewBtn').classList.toggle('active', view === 'map');
+    document.getElementById('statsViewBtn').classList.toggle('active', view === 'stats');
+
+    if (view === 'map') setTimeout(() => initMap(), 0);
+    if (view === 'stats') fetchAndRenderHeatmap();
 }
+
+async function fetchAndRenderHeatmap() {
+    if (!selectedPattern) return;
+    const pythonDay = (new Date().getDay() + 6) % 7; // JS Sun=0 → Python Mon=0
+    try {
+        const res = await fetch(`/api/patterns/${selectedPattern.id}/heatmap?day=${pythonDay}`);
+        if (res.ok) {
+            heatmapData = await res.json();
+            renderHeatmap();
+        }
+    } catch (e) { /* non-critical */ }
+}
+
+function segmentColor(normalized) {
+    // Green (#10b981) = fast, Amber (#f59e0b) = slow
+    const r = Math.round(16  + normalized * (245 - 16));
+    const g = Math.round(185 + normalized * (158 - 185));
+    const b = Math.round(129 + normalized * (11  - 129));
+    return `rgba(${r},${g},${b},0.4)`;
+}
+
+function renderHeatmap() {
+    const container = document.getElementById('heatmapContainer');
+    const currentHour = new Date().getHours();
+    const pythonDay = (new Date().getDay() + 6) % 7;
+    const dayName = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][pythonDay];
+    const hours = Array.from({length: 24}, (_, i) => i);
+
+    let html = `<div class="heatmap-title">Travel time per segment — ${dayName}</div>`;
+    html += `<div class="heatmap-scroll"><table class="heatmap-table"><thead><tr>`;
+    html += `<th class="heatmap-stop-col">Stop</th>`;
+    hours.forEach(h => {
+        html += `<th class="heatmap-hour-col${h === currentHour ? ' heatmap-current-hour' : ''}">${String(h).padStart(2,'0')}</th>`;
+    });
+    html += `</tr></thead><tbody>`;
+
+    patternPath.forEach((step, idx) => {
+        if (idx === 0) return;
+        const prev = patternPath[idx - 1];
+        const key = `${prev.stop_id}__${step.stop_id}`;
+        const rowData = heatmapData[key] || {};
+
+        const values = hours.map(h => rowData[h]?.avg_seconds).filter(Boolean);
+        const rowMin = values.length ? Math.min(...values) : 0;
+        const rowMax = values.length ? Math.max(...values) : 0;
+
+        const distM = Math.round((step.distance - prev.distance) * 1000);
+        const distLabel = distM > 0 ? ` (${distM >= 1000 ? (distM/1000).toFixed(1)+'km' : distM+'m'})` : '';
+        html += `<tr><td class="heatmap-stop-label">${step.stop_sequence}.${distLabel} ${step.name}</td>`;
+        hours.forEach(h => {
+            const d = rowData[h];
+            if (d) {
+                const norm = rowMax > rowMin ? (d.avg_seconds - rowMin) / (rowMax - rowMin) : 0.5;
+                html += `<td class="heatmap-cell" style="background:${segmentColor(norm)}" title="${formatDuration(d.avg_seconds)} · ${d.sample_count} samples">${formatDuration(d.avg_seconds)}</td>`;
+            } else {
+                html += `<td class="heatmap-cell heatmap-empty"></td>`;
+            }
+        });
+        html += `</tr>`;
+    });
+
+    html += `</tbody></table></div>`;
+    container.innerHTML = html;
+}
+
+// ---- Map View ----
 
 function initMap() {
     if (!map) {
@@ -872,7 +1033,7 @@ function drawRouteOnMap() {
             opacity: 1,
             fillOpacity: 1
         }).addTo(map);
-        marker.bindTooltip(step.name, { direction: 'top', opacity: 0.95 });
+        marker.bindTooltip(`${step.stop_sequence}. ${step.name}`, { direction: 'top', opacity: 0.95 });
         routeStopMarkers[String(step.stop_id)] = marker;
     });
 

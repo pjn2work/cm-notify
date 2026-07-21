@@ -35,3 +35,6 @@ MANIFEST
 # PyCharm
 .idea
 
+# SQLite database
+*.db
+
